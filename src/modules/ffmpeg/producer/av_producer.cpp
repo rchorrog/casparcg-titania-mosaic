@@ -49,6 +49,7 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <deque>
 #include <iomanip>
 #include <memory>
@@ -131,6 +132,15 @@ class Decoder
     AVStream*         st       = nullptr;
     int64_t           next_pts = AV_NOPTS_VALUE;
     std::atomic<bool> eof      = {false};
+
+    /// Set by the decode thread when the source's timeline jumps; consumed once by the
+    /// producer thread, which rebuilds the filter graph. See the detection site below for why
+    /// it cannot be done anywhere later.
+    std::atomic<bool> discontinuity = {false};
+
+    /// Latest decoded SOURCE timestamp, in AV_TIME_BASE units; AV_NOPTS_VALUE until the first
+    /// frame carries one. Written by the decode thread, read by the producer thread for state.
+    std::atomic<int64_t> source_time = {AV_NOPTS_VALUE};
 
     std::queue<std::shared_ptr<AVPacket>> input;
     mutable boost::mutex                  input_mutex;
@@ -239,6 +249,41 @@ class Decoder
                         // TODO (fix) is this always best?
                         av_frame->pts = av_frame->best_effort_timestamp;
 
+                        // ── Discontinuity detection, and it has to be HERE ──────────────
+                        // This is the last point where the timestamp is still the source's
+                        // own. Downstream, `vf_fps` replaces it with a counter
+                        // (`libavfilter/vf_fps.c:305`: `frame->pts = s->next_pts++`), so a
+                        // jump is undetectable from `Frame::pts` -- and worse, `vf_fps` never
+                        // re-seeds that counter, so after a jump it silently drops every
+                        // frame (backward) or duplicates one (forward) until the gap is made
+                        // up. A 33-bit MPEG-TS PTS wrap is ~26.5 h, so on a 24/7 wall that is
+                        // a tile frozen for a day, with a healthy-looking buffer and no
+                        // underflow tag anywhere.
+                        //
+                        // Threshold, not equality: normal jitter and B-frame reordering move
+                        // the timestamp around by a frame or two. Five seconds in stream time
+                        // is far past anything legitimate and far below a wrap.
+                        if (next_pts != AV_NOPTS_VALUE && av_frame->pts != AV_NOPTS_VALUE) {
+                            const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
+                            if (std::abs(av_frame->pts - next_pts) > threshold) {
+                                discontinuity = true;
+                            }
+                        }
+
+                        // Publish the SOURCE timestamp, for the same reason the check above sits
+                        // here: this is the last place it exists. Everything downstream -- and
+                        // that includes `file/time`, which is what an operator reads over OSC --
+                        // is derived from the filter graph's output, i.e. from `vf_fps`'s counter
+                        // rather than from the stream. The two agree while nothing is dropped and
+                        // diverge silently afterwards, which is exactly the failure worth
+                        // catching, and until now there was no way to see it happen.
+                        //
+                        // Rescaled to AV_TIME_BASE so it can be compared across streams whose
+                        // time bases differ; comparing raw ticks between two inputs is wrong.
+                        if (av_frame->pts != AV_NOPTS_VALUE) {
+                            source_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
+                        }
+
 #if LIBAVUTIL_VERSION_MAJOR < 58
                         auto duration_pts = av_frame->pkt_duration;
 #else
@@ -298,6 +343,14 @@ class Decoder
             // Do nothing...
         }
     }
+
+    /// True once since the last call: this stream's timeline jumped. Consumed by the producer
+    /// thread, which rebuilds the filter graph so `vf_fps` re-seeds its output counter.
+    bool take_discontinuity() { return discontinuity.exchange(false); }
+
+    /// Source-side clock, AV_TIME_BASE units. See the write site for why this is not the same
+    /// thing as `Frame::pts`.
+    int64_t take_source_time() const { return source_time.load(); }
 
     bool want_packet() const
     {
@@ -742,6 +795,41 @@ struct AVProducer::Impl
 
     int latency_ = 0;
 
+    // ── Rate governor ──────────────────────────────────────────────────────────────────
+    // Twenty encoders and the host each run a free crystal, and nothing locks them together.
+    // A source fractionally FASTER than the channel fills `buffer_`, parks the producer thread
+    // on `buffer_cond_`, back-pressures the demuxer and eventually overflows the socket --
+    // packet loss and macroblocking, not a clean drop. A source fractionally SLOWER starves,
+    // and each starve costs a frame of latency that is never given back, because underflow
+    // repeats without consuming.
+    //
+    // So the system can currently only repeat or corrupt; it has no way to DROP. The governor
+    // adds that one missing direction, and reports the offset it is correcting for, in ppm,
+    // which is the number that identifies which encoder is actually at fault.
+    //
+    // Deliberately NOT timestamp-based: `vf_fps` replaces every PTS with a counter
+    // (`libavfilter/vf_fps.c:305`), so downstream timestamps carry no source timing at all and
+    // scheduling on them would be `pop_front()` in disguise.
+    bool   governor_enabled_ = false;
+    int    governor_target_  = 4;
+    int    governor_band_    = 2;
+    int    governor_min_gap_ = 25;
+    double occupancy_avg_    = 0.0;
+    bool   occupancy_primed_ = false;
+
+    int64_t ticks_            = 0;
+    int64_t drops_            = 0;
+    int64_t repeats_          = 0;
+    int64_t discontinuities_  = 0;
+    int64_t last_correction_  = 0;
+
+    /// Mirror of `buffer_.size()`, published under `buffer_mutex_` and read without it.
+    ///
+    /// `update_state()` runs from a `CASPAR_SCOPE_EXIT` in several functions, some of which
+    /// hold `buffer_mutex_`; `boost::mutex` is not recursive, so reading the deque there could
+    /// deadlock depending on declaration order. An atomic sidesteps the question entirely.
+    std::atomic<int64_t> buffer_size_{0};
+
     boost::thread thread_;
 
     Impl(std::shared_ptr<core::frame_factory> frame_factory,
@@ -777,6 +865,25 @@ struct AVProducer::Impl
         graph_->set_color("frame-time", diagnostics::color(0.0f, 1.0f, 0.0f));
         graph_->set_color("decode-time", diagnostics::color(0.0f, 1.0f, 1.0f));
         graph_->set_color("buffer", diagnostics::color(1.0f, 1.0f, 0.0f));
+        graph_->set_color("drop", diagnostics::color(1.0f, 0.3f, 0.0f));
+        graph_->set_color("discontinuity", diagnostics::color(1.0f, 0.0f, 1.0f));
+
+        // Same read-at-point-of-use pattern the module already uses for `threads` and
+        // `auto-deinterlace`; no plumbing, and absent config means today's behaviour exactly.
+        governor_enabled_ = env::properties().get(L"configuration.ffmpeg.producer.sync.enabled", false);
+        governor_target_ =
+            std::max(1, env::properties().get(L"configuration.ffmpeg.producer.sync.target-frames", 4));
+        governor_band_ =
+            std::max(1, env::properties().get(L"configuration.ffmpeg.producer.sync.deadband-frames", 2));
+        governor_min_gap_ =
+            std::max(1, env::properties().get(L"configuration.ffmpeg.producer.sync.min-interval-frames", 25));
+
+        // The governor needs headroom ABOVE its target or it can never see "too full" -- and
+        // the producer thread parking on `buffer_cond_` is what causes packet loss on a fast
+        // feed, which is the failure the governor exists to prevent.
+        if (governor_enabled_) {
+            buffer_capacity_ = std::max(buffer_capacity_, governor_target_ * 3 + 2);
+        }
 
         state_["file/name"] = u8(name_);
         state_["file/path"] = u8(path_);
@@ -883,6 +990,43 @@ struct AVProducer::Impl
             }
 
             {
+                // ── Recover from a source-side timeline jump ────────────────────────────
+                // A wrap, an encoder restart or a reconnect leaves `vf_fps` comparing new
+                // timestamps against a counter seeded from the old ones, and it never
+                // re-seeds itself -- so it drops or duplicates every frame until the
+                // difference is made up. At a 33-bit wrap that is 26.5 hours of frozen tile.
+                //
+                // Rebuilding the filters is the existing cure: `reset()` constructs both
+                // `Filter`s afresh, which re-runs `vf_fps`'s `config_props` and re-seeds its
+                // counter. `seek_internal` already does exactly this for seeks; a
+                // discontinuity needs the same treatment without moving the read position,
+                // which for a live input is not seekable anyway.
+                bool discontinuity = input_.take_discontinuity();
+                for (auto& p : decoders_) {
+                    // Every decoder is polled, not just the first to report -- `take_` clears
+                    // the flag, and leaving one set would fire a second reset next tick.
+                    discontinuity = p.second.take_discontinuity() || discontinuity;
+                }
+
+                if (discontinuity) {
+                    discontinuities_ += 1;
+                    if (discontinuities_ == 1 || discontinuities_ % 25 == 0) {
+                        // Latched: a flapping encoder must not fill the log across 20 layers.
+                        CASPAR_LOG(info) << print() << " timeline discontinuity; resynchronising ("
+                                         << discontinuities_ << " so far)";
+                    }
+                    graph_->set_tag(diagnostics::tag_severity::WARNING, "discontinuity");
+
+                    // Not `seek_internal`: a live stream cannot seek, and asking it to would
+                    // fail or reopen. Only the filter graph's notion of time is stale.
+                    frame_flush_ = true;
+                    reset(input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0);
+                    frame = Frame{};
+                    continue;
+                }
+            }
+
+            {
                 // TODO (perf) seek as soon as input is past duration or eof.
 
                 auto start    = start_.load();
@@ -983,6 +1127,7 @@ struct AVProducer::Impl
                 if (seek_ == AV_NOPTS_VALUE) {
                     buffer_.push_back(frame);
                 }
+                buffer_size_ = static_cast<int64_t>(buffer_.size());
             }
 
             if (format_desc_.field_count != 2 || frame_count_ % 2 == 1) {
@@ -1006,6 +1151,82 @@ struct AVProducer::Impl
         state_["file/clip"] = {start().value_or(0) / format_desc_.fps, duration().value_or(0) / format_desc_.fps};
         state_["file/time"] = {time() / format_desc_.fps, file_duration().value_or(0) / format_desc_.fps};
         state_["loop"]      = loop_;
+
+        // ── Ship the measurement, whether or not the governor is on ─────────────────────
+        // These are useful precisely when the correction is DISABLED: they say how far each
+        // encoder's clock is from the channel's, so a site can be diagnosed before anything
+        // is changed. Turning the governor on without this data first would be guessing.
+        state_["sync/mode"]            = governor_enabled_ ? std::string("governed") : std::string("passive");
+        // Published because a timestamp source that changes silently is the worst kind: every
+        // sync/* number below means something different depending on it. Read here rather than
+        // passed from Input, since only live inputs actually apply it -- see av_input.cpp.
+        state_["sync/timestamps"] =
+            env::properties().get(L"configuration.ffmpeg.producer.sync.wallclock-timestamps", false)
+                ? std::string("wallclock")
+                : std::string("source");
+        state_["sync/repeats"]         = repeats_;
+        state_["sync/drops"]           = drops_;
+        state_["sync/discontinuities"] = discontinuities_;
+        state_["sync/reconnects"]      = input_.reconnects();
+
+        // **The ratchet, named.** Every repeat adds a frame of latency and every drop removes
+        // one, so this is the accumulated slip in frames. Flat means governed; climbing means
+        // the feed is slipping and nothing is giving the frames back. This single number is
+        // what the whole exercise is about.
+        state_["sync/net-slip-frames"] = repeats_ - drops_;
+
+        // ── The source clock, and how far the presented one has drifted from it ─────────
+        // `file/time` above is derived from the filter graph's output, so it counts frames
+        // PRESENTED. `vf_fps` replaces the stream timestamp with its own counter
+        // (`vf_fps.c:305`), which means the two agree while nothing is dropped and part company
+        // silently when something is -- and there was previously no way to observe that from
+        // outside. `sync/source-time` is the stream's own clock, normalised the same way as
+        // `file/time` so the two are directly comparable, and `sync/graph-slip-frames` is their
+        // difference in frames.
+        //
+        // A non-zero, growing `graph-slip-frames` means the graph is dropping or duplicating
+        // against the source: the failure that presents as a frozen tile with a healthy buffer.
+        // For two feeds off ONE encoder -- a main/backup pair -- `source-time` is directly
+        // comparable between layers, which `file/time` is not, because each producer normalises
+        // against its own `input_->start_time`.
+        {
+            int64_t src = AV_NOPTS_VALUE;
+            for (auto& p : decoders_) {
+                if (p.second.ctx && p.second.ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    src = p.second.take_source_time();
+                    break;
+                }
+            }
+
+            // `operator->` yields the AVFormatContext, which is null between a failed reopen
+            // and the next successful one -- a state this build can now actually reach, since
+            // the input reconnects instead of dying. The surrounding code runs where it cannot
+            // be null; this runs on every state tick, so it can.
+            const auto* ic        = input_.operator->();
+            const auto  start_time =
+                (ic != nullptr && ic->start_time != AV_NOPTS_VALUE) ? ic->start_time : static_cast<int64_t>(0);
+            if (src != AV_NOPTS_VALUE) {
+                const auto normalised = src - start_time;
+                state_["sync/source-time"] = normalised / static_cast<double>(AV_TIME_BASE);
+                state_["sync/graph-slip-frames"] =
+                    static_cast<int64_t>(std::llround((normalised - frame_time_) /
+                                                      static_cast<double>(frame_duration_ > 0 ? frame_duration_ : 1)));
+            } else {
+                // Said explicitly rather than omitted: a missing field reads as a broken
+                // exporter, and "this stream carries no usable timestamps" is a real answer.
+                state_["sync/source-time"]       = -1.0;
+                state_["sync/graph-slip-frames"] = 0;
+            }
+        }
+
+        // The offset the governor is correcting for, in parts per million -- i.e. how far this
+        // encoder's crystal is from the host's. Identifies WHICH encoder to fix, rather than
+        // papering over all twenty.
+        state_["sync/offset-ppm"] = ticks_ > 0 ? (static_cast<double>(drops_ - repeats_) / ticks_) * 1e6 : 0.0;
+
+        state_["sync/buffer"]        = buffer_size_.load();
+        state_["sync/buffer-avg"]    = occupancy_avg_;
+        state_["sync/buffer-target"] = static_cast<int64_t>(governor_target_);
     }
 
     core::draw_frame prev_frame(const core::video_field field)
@@ -1035,13 +1256,27 @@ struct AVProducer::Impl
         return !buffer_.empty() || frame_;
     }
 
+    /// EWMA weight for a ~4 second time constant.
+    ///
+    /// Long against transport jitter, short against clock drift -- which is the whole
+    /// discrimination the governor rests on. A shorter constant would chase jitter and correct
+    /// constantly; a longer one would take minutes to notice a genuinely fast encoder.
+    double occupancy_alpha() const { return 1.0 / std::max(1.0, format_desc_.fps * 4.0); }
+
     core::draw_frame next_frame(const core::video_field field)
     {
         CASPAR_SCOPE_EXIT { update_state(); };
 
         boost::lock_guard<boost::mutex> lock(buffer_mutex_);
 
-        if (buffer_.empty() || (frame_flush_ && buffer_.size() < 4)) {
+        ticks_ += 1;
+
+        // The post-flush prefill. The stock `4` is unrelated to `buffer_capacity_`, so a layer
+        // resumes with 80 ms of runway inside a 240 ms ring and grazes empty on ordinary
+        // jitter. Under the governor it follows the configured target instead.
+        const auto prefill = governor_enabled_ ? governor_target_ : 4;
+
+        if (buffer_.empty() || (frame_flush_ && static_cast<int>(buffer_.size()) < prefill)) {
             auto start    = start_.load();
             auto duration = duration_.load();
 
@@ -1058,7 +1293,43 @@ struct AVProducer::Impl
             }
             graph_->set_tag(diagnostics::tag_severity::WARNING, "underflow");
             latency_ += 1;
+            repeats_ += 1;
+            // Occupancy is genuinely zero; let the average see that so the governor does not
+            // decide to drop moments after a starve.
+            occupancy_avg_ = occupancy_primed_ ? occupancy_avg_ * (1.0 - occupancy_alpha()) : 0.0;
             return core::draw_frame{};
+        }
+
+        // ── The governor: the one direction the pipeline is missing ─────────────────────
+        // Deliberately placed AFTER the underflow branch and BEFORE the parity guard: it must
+        // not run when there is nothing to serve, and a drop must not leave the wrong field at
+        // the head of the buffer.
+        if (governor_enabled_) {
+            const auto occupancy = static_cast<double>(buffer_.size());
+            const auto alpha     = occupancy_alpha();
+            occupancy_avg_       = occupancy_primed_ ? occupancy_avg_ + alpha * (occupancy - occupancy_avg_) : occupancy;
+            occupancy_primed_    = true;
+
+            // Frames are dropped a whole field-pair at a time. Dropping an odd number when
+            // interlaced inverts parity, and the guard below would then reject the next call
+            // as an underflow -- a correction that manufactures the fault it is fixing.
+            const auto step = std::max(1, format_desc_.field_count);
+
+            const bool over      = occupancy_avg_ > (governor_target_ + governor_band_);
+            const bool have_room = static_cast<int>(buffer_.size()) > governor_target_ + step;
+            const bool settled   = (ticks_ - last_correction_) >= governor_min_gap_;
+
+            if (over && have_room && settled) {
+                for (int i = 0; i < step && buffer_.size() > 1; ++i) {
+                    buffer_.pop_front();
+                    drops_ += 1;
+                }
+                buffer_size_ = static_cast<int64_t>(buffer_.size());
+                last_correction_ = ticks_;
+                occupancy_avg_   = static_cast<double>(buffer_.size());
+                buffer_cond_.notify_all();
+                graph_->set_tag(diagnostics::tag_severity::INFO, "drop");
+            }
         }
 
         if (format_desc_.field_count == 2) {
@@ -1082,6 +1353,7 @@ struct AVProducer::Impl
         frame_flush_    = false;
 
         buffer_.pop_front();
+        buffer_size_ = static_cast<int64_t>(buffer_.size());
         buffer_cond_.notify_all();
 
         graph_->set_value("buffer", static_cast<double>(buffer_.size()) / static_cast<double>(buffer_capacity_));
@@ -1098,6 +1370,12 @@ struct AVProducer::Impl
         {
             boost::lock_guard<boost::mutex> lock(buffer_mutex_);
             buffer_.clear();
+            buffer_size_ = 0;
+            // The timeline restarts here, so the occupancy average must not carry the old
+            // stream's level across -- it would make the governor correct for a condition that
+            // no longer exists.
+            occupancy_primed_ = false;
+            occupancy_avg_    = 0.0;
             buffer_cond_.notify_all();
             graph_->set_value("buffer", static_cast<double>(buffer_.size()) / static_cast<double>(buffer_capacity_));
         }
