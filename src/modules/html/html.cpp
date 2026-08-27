@@ -190,6 +190,13 @@ class renderer_application
             command_line->AppendSwitchWithValue("use-gl", "disabled");
         }
 
+        // Ningun template HTML de Mosaic usa WebGL. use-gl=disabled arriba no evita que
+        // Chromium intente igualmente negociar un contexto WebGL via ANGLE/SwiftShader en
+        // los primeros lanzamientos del gpu-process (crash real, visto en produccion) -
+        // desactivar WebGL a nivel de contenido evita que se llegue a pedir ese contexto.
+        command_line->AppendSwitch("disable-webgl");
+        command_line->AppendSwitch("disable-webgl2");
+
 #if __unix__
         if (getenv("DISPLAY") == nullptr) {
             command_line->AppendSwitchWithValue("ozone-platform", "headless");
