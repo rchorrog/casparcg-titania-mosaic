@@ -1006,6 +1006,13 @@ struct AVProducer::Impl
         state_["file/clip"] = {start().value_or(0) / format_desc_.fps, duration().value_or(0) / format_desc_.fps};
         state_["file/time"] = {time() / format_desc_.fps, file_duration().value_or(0) / format_desc_.fps};
         state_["loop"]      = loop_;
+        // file/time ya resta input_->start_time (el instante en que ESTE producer concreto vio su
+        // primer paquete al conectar) antes de exponerse — necesario para comparar de verdad el
+        // PTS de dos producers distintos (p.ej. Main/Backup), que normalizan cada uno desde su
+        // propio start_time. Exponer también ese offset permite reconstruir el PTS absoluto de
+        // origen como file/time + file/origin_start_time, sin ambigüedad.
+        const auto origin_start_time = input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0;
+        state_["file/origin_start_time"] = static_cast<double>(origin_start_time) / AV_TIME_BASE;
     }
 
     core::draw_frame prev_frame(const core::video_field field)
