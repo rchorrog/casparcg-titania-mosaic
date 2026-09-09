@@ -717,6 +717,12 @@ struct AVProducer::Impl
     std::atomic<int64_t> start_{AV_NOPTS_VALUE};
     std::atomic<int64_t> duration_{AV_NOPTS_VALUE};
     std::atomic<int64_t> input_duration_{AV_NOPTS_VALUE};
+    // Cache de input_->start_time para exponerla desde update_state() (hilo del monitor/OSC, no el
+    // hilo de decodificacion que es el unico dueno de input_ - ver input_duration_ justo arriba,
+    // mismo motivo). Leer input_-> directamente desde update_state() es una carrera de datos con
+    // los reconnects internos de Input (Input::internal_reset()), mas probable con varias señales
+    // UDP en vivo a la vez - causaba un SIGSEGV intermitente.
+    std::atomic<int64_t> origin_start_time_{AV_NOPTS_VALUE};
     std::atomic<int64_t> seek_{AV_NOPTS_VALUE};
     std::atomic<bool>    loop_{false};
 
@@ -841,6 +847,10 @@ struct AVProducer::Impl
 
         if (input_duration_ == AV_NOPTS_VALUE) {
             input_duration_ = input_->duration;
+        }
+
+        if (origin_start_time_ == AV_NOPTS_VALUE) {
+            origin_start_time_ = input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0;
         }
 
         {
@@ -1010,9 +1020,11 @@ struct AVProducer::Impl
         // primer paquete al conectar) antes de exponerse — necesario para comparar de verdad el
         // PTS de dos producers distintos (p.ej. Main/Backup), que normalizan cada uno desde su
         // propio start_time. Exponer también ese offset permite reconstruir el PTS absoluto de
-        // origen como file/time + file/origin_start_time, sin ambigüedad.
-        const auto origin_start_time = input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0;
-        state_["file/origin_start_time"] = static_cast<double>(origin_start_time) / AV_TIME_BASE;
+        // origen como file/time + file/origin_start_time, sin ambigüedad. Se lee del atomic
+        // origin_start_time_ (cacheado en run(), hilo de decodificacion) en vez de input_->
+        // directamente - ver comentario junto a la declaracion del atomic.
+        const auto origin_start_time     = origin_start_time_.load();
+        state_["file/origin_start_time"] = static_cast<double>(origin_start_time != AV_NOPTS_VALUE ? origin_start_time : 0) / AV_TIME_BASE;
     }
 
     core::draw_frame prev_frame(const core::video_field field)
