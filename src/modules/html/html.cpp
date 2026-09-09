@@ -225,14 +225,6 @@ class renderer_application
             command_line->AppendSwitch("disable-gpu");
             command_line->AppendSwitch("disable-gpu-compositing");
             command_line->AppendSwitchWithValue("disable-gpu-vsync", "gpu");
-
-            // El "gpu-process" (subproceso aparte de CEF) sigue crasheando de forma cronica bajo
-            // headless (SIGSEGV via ANGLE/SwiftShader, ver mosaic4-casparcg-sigill-crash) pese a
-            // use-gl=disabled/disable-webgl de arriba. Con la GPU ya desactivada por completo en
-            // esta rama, no hay ninguna ventaja en mantener ese subproceso aparte - in-process-gpu
-            // hace que el (poco) trabajo de composicion se ejecute dentro del proceso principal,
-            // eliminando el subproceso que se cae en bucle de fondo.
-            command_line->AppendSwitch("in-process-gpu");
         }
     }
 
