@@ -59,9 +59,13 @@
 #include <protocol/osc/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <future>
 #include <memory>
+#include <optional>
+#include <thread>
+#include <type_traits>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/regex.hpp>
@@ -377,6 +381,97 @@ std::wstring resume_command(command_context& ctx)
 {
     ctx.channel.stage->resume(ctx.layer_index());
     return L"202 RESUME OK\r\n";
+}
+
+// RELINK_SIGNAL CH1-LAYER1 CH2-LAYER2
+//
+// Resincroniza dos senales en vivo (p.ej. Main/Backup de un mismo mosaico) comparando su PTS
+// absoluto real (file/time + file/origin_start_time, ver docs/CASPARCG_PTS_SYNC_ANALYSIS_RESULT.md)
+// y pausando la que va por delante exactamente la diferencia en segundos. Confirmado a mano el
+// 2026-09-10: PAUSE en un producer ffmpeg de una entrada UDP en vivo retiene el buffer en vez de
+// saltar a directo al reanudar, asi que sirve como mecanismo de retardo controlado.
+std::wstring relink_signal_command(command_context& ctx)
+{
+    auto parse_channel_layer = [](const std::wstring& spec) {
+        std::vector<std::wstring> parts;
+        boost::split(parts, spec, boost::is_any_of(L"-"));
+        if (parts.size() != 2) {
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                    << msg_info(L"RELINK_SIGNAL: se esperaba CANAL-CAPA, se recibio " + spec));
+        }
+        return std::make_pair(std::stoi(parts.at(0)), std::stoi(parts.at(1)));
+    };
+
+    const auto [ch1, l1] = parse_channel_layer(ctx.parameters.at(0));
+    const auto [ch2, l2] = parse_channel_layer(ctx.parameters.at(1));
+
+    const auto& chan1 = ctx.channels->at(ch1 - 1);
+    const auto& chan2 = ctx.channels->at(ch2 - 1);
+
+    auto read_absolute_pts = [](const core::monitor::state& st, int layer) -> std::optional<double> {
+        const auto time_key   = "layer/" + std::to_string(layer) + "/foreground/file/time";
+        const auto origin_key = "layer/" + std::to_string(layer) + "/foreground/file/origin_start_time";
+
+        auto to_double = [](const core::monitor::data_t& v) {
+            return boost::apply_visitor(
+                [](auto&& value) -> double {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_arithmetic<T>::value) {
+                        return static_cast<double>(value);
+                    } else {
+                        return 0.0;
+                    }
+                },
+                v);
+        };
+
+        std::optional<double> pts;
+        std::optional<double> origin;
+        for (const auto& p : st) {
+            if (p.second.empty())
+                continue;
+            if (p.first == time_key) {
+                pts = to_double(p.second[0]);
+            } else if (p.first == origin_key) {
+                origin = to_double(p.second[0]);
+            }
+        }
+
+        if (!pts || !origin)
+            return std::nullopt;
+
+        return *pts + *origin;
+    };
+
+    const auto abs1 = read_absolute_pts(chan1.raw_channel->state(), l1);
+    const auto abs2 = read_absolute_pts(chan2.raw_channel->state(), l2);
+
+    if (!abs1 || !abs2) {
+        CASPAR_THROW_EXCEPTION(
+            caspar_exception()
+            << msg_info(L"RELINK_SIGNAL: file/origin_start_time no disponible todavia en una de las dos capas"));
+    }
+
+    const double diff_seconds = *abs1 - *abs2;
+
+    if (std::abs(diff_seconds) < 0.001) {
+        return L"202 RELINK_SIGNAL OK\r\n";
+    }
+
+    const bool                              first_is_ahead = diff_seconds > 0;
+    const std::shared_ptr<core::stage_base> ahead_stage     = first_is_ahead ? chan1.stage : chan2.stage;
+    const int                               ahead_layer     = first_is_ahead ? l1 : l2;
+    const double                            delay_seconds   = std::abs(diff_seconds);
+
+    ahead_stage->pause(ahead_layer);
+
+    const auto delay = std::chrono::milliseconds(static_cast<int64_t>(delay_seconds * 1000.0));
+    std::thread([ahead_stage, ahead_layer, delay]() {
+        std::this_thread::sleep_for(delay);
+        ahead_stage->resume(ahead_layer);
+    }).detach();
+
+    return L"202 RELINK_SIGNAL OK\r\n";
 }
 
 std::wstring stop_command(command_context& ctx)
@@ -1729,6 +1824,7 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"Basic Commands", L"ADD", add_command, 1);
     repo->register_channel_command(L"Basic Commands", L"REMOVE", remove_command, 0);
     repo->register_channel_command(L"Basic Commands", L"PRINT", print_command, 0);
+    repo->register_command(L"Basic Commands", L"RELINK_SIGNAL", relink_signal_command, 2);
     repo->register_command(L"Basic Commands", L"CLEAR ALL", clear_all_command, 0);
     repo->register_command(L"Basic Commands", L"LOG LEVEL", log_level_command, 0);
     repo->register_channel_command(L"Basic Commands", L"SET", set_command, 2);
