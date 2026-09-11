@@ -393,9 +393,17 @@ std::wstring resume_command(command_context& ctx)
 // el buffer en vez de saltar a directo al reanudar, asi que sirve como mecanismo de retardo
 // controlado.
 //
-// sync/source-time solo es comparable de verdad entre dos capas si sus fuentes comparten epoch de
-// PTS (mismo codificador, o <wallclock-timestamps> activado en ambas) - ver BUILD.md. Si no lo
-// comparten, la resta sigue siendo un numero, pero no significa lo que este comando asume.
+// OJO con que se compara: sync/source-time viene NORMALIZADO (src - start_time, "segundos desde
+// que ESTE producer conecto"), igual que file/time - sirve para compararlo con file/time dentro de
+// la misma capa (graph-slip-frames), pero entre capas distintas no dice nada si conectaron en
+// instantes distintos. El valor comparable entre capas es el absoluto:
+// file/origin_start_time + sync/source-time.
+//
+// Y ese absoluto solo significa algo real si ambas fuentes comparten epoch: mismo codificador, o
+// <wallclock-timestamps> activado (entonces es hora de pared de llegada a ESTA maquina, el mismo
+// reloj para las dos senales). Con encoders independientes sin PTP y sin wallclock, cada uno
+// arranca su contador en su propio arranque y la resta mide jitter de arranque de contenedores,
+// no desincronizacion real - ver BUILD.md.
 std::wstring relink_signal_command(command_context& ctx)
 {
     auto parse_channel_layer = [](const std::wstring& spec) {
@@ -414,45 +422,55 @@ std::wstring relink_signal_command(command_context& ctx)
     const auto& chan1 = ctx.channels->at(ch1 - 1);
     const auto& chan2 = ctx.channels->at(ch2 - 1);
 
-    auto read_source_time = [](const core::monitor::state& st, int layer) -> std::optional<double> {
+    auto read_absolute_source_time = [](const core::monitor::state& st, int layer) -> std::optional<double> {
         // video_channel::state() antepone "stage/" a todo lo que viene de stage_->state()
         // (ver video_channel.cpp: state["stage"] = stage_->state();) - sin ese prefijo la
         // busqueda nunca encuentra nada, aunque el campo si este poblado (confirmado via INFO).
-        const auto key = "stage/layer/" + std::to_string(layer) + "/foreground/sync/source-time";
+        const auto prefix       = "stage/layer/" + std::to_string(layer) + "/foreground/";
+        const auto elapsed_key  = prefix + "sync/source-time";
+        const auto origin_key   = prefix + "file/origin_start_time";
 
-        for (const auto& p : st) {
-            if (p.first != key || p.second.empty())
-                continue;
-
-            const auto value = boost::apply_visitor(
-                [](auto&& v) -> double {
-                    using T = std::decay_t<decltype(v)>;
+        auto to_double = [](const core::monitor::data_t& v) {
+            return boost::apply_visitor(
+                [](auto&& value) -> double {
+                    using T = std::decay_t<decltype(value)>;
                     if constexpr (std::is_arithmetic<T>::value) {
-                        return static_cast<double>(v);
+                        return static_cast<double>(value);
                     } else {
                         return -1.0;
                     }
                 },
-                p.second[0]);
+                v);
+        };
 
-            // -1.0 es el centinela explicito de "sin PTS utilizable" (ver update_state() en
-            // av_producer.cpp) - no un valor real que restar.
-            if (value < 0.0)
-                return std::nullopt;
-
-            return value;
+        std::optional<double> elapsed;
+        std::optional<double> origin;
+        for (const auto& p : st) {
+            if (p.second.empty())
+                continue;
+            if (p.first == elapsed_key) {
+                elapsed = to_double(p.second[0]);
+            } else if (p.first == origin_key) {
+                origin = to_double(p.second[0]);
+            }
         }
 
-        return std::nullopt;
+        // -1.0 en sync/source-time es el centinela explicito de "sin PTS utilizable" (ver
+        // update_state() en av_producer.cpp) - no un valor real que sumar.
+        if (!elapsed || !origin || *elapsed < 0.0)
+            return std::nullopt;
+
+        return *origin + *elapsed;
     };
 
-    const auto abs1 = read_source_time(chan1.raw_channel->state(), l1);
-    const auto abs2 = read_source_time(chan2.raw_channel->state(), l2);
+    const auto abs1 = read_absolute_source_time(chan1.raw_channel->state(), l1);
+    const auto abs2 = read_absolute_source_time(chan2.raw_channel->state(), l2);
 
     if (!abs1 || !abs2) {
         CASPAR_THROW_EXCEPTION(
             caspar_exception()
-            << msg_info(L"RELINK_SIGNAL: sync/source-time no disponible todavia en una de las dos capas"));
+            << msg_info(
+                   L"RELINK_SIGNAL: sync/source-time o file/origin_start_time no disponibles todavia en una de las dos capas"));
     }
 
     const double diff_seconds = *abs1 - *abs2;
