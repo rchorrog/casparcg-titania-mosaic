@@ -415,7 +415,10 @@ std::wstring relink_signal_command(command_context& ctx)
     const auto& chan2 = ctx.channels->at(ch2 - 1);
 
     auto read_source_time = [](const core::monitor::state& st, int layer) -> std::optional<double> {
-        const auto key = "layer/" + std::to_string(layer) + "/foreground/sync/source-time";
+        // video_channel::state() antepone "stage/" a todo lo que viene de stage_->state()
+        // (ver video_channel.cpp: state["stage"] = stage_->state();) - sin ese prefijo la
+        // busqueda nunca encuentra nada, aunque el campo si este poblado (confirmado via INFO).
+        const auto key = "stage/layer/" + std::to_string(layer) + "/foreground/sync/source-time";
 
         for (const auto& p : st) {
             if (p.first != key || p.second.empty())
