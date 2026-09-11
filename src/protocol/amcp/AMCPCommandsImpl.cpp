@@ -385,11 +385,17 @@ std::wstring resume_command(command_context& ctx)
 
 // RELINK_SIGNAL CH1-LAYER1 CH2-LAYER2
 //
-// Resincroniza dos senales en vivo (p.ej. Main/Backup de un mismo mosaico) comparando su PTS
-// absoluto real (file/time + file/origin_start_time, ver docs/CASPARCG_PTS_SYNC_ANALYSIS_RESULT.md)
-// y pausando la que va por delante exactamente la diferencia en segundos. Confirmado a mano el
-// 2026-09-10: PAUSE en un producer ffmpeg de una entrada UDP en vivo retiene el buffer en vez de
-// saltar a directo al reanudar, asi que sirve como mecanismo de retardo controlado.
+// Resincroniza dos senales en vivo (p.ej. Main/Backup de un mismo mosaico) comparando
+// sync/source-time (PR #1, fix/srt-input-recovery-and-rate-governor: el PTS real de la senal,
+// tomado en el decodificador antes de que vf_fps lo sustituya por un contador propio, ver
+// av_producer.cpp) y pausando la que va por delante exactamente la diferencia en segundos.
+// Confirmado a mano el 2026-09-10: PAUSE en un producer ffmpeg de una entrada UDP en vivo retiene
+// el buffer en vez de saltar a directo al reanudar, asi que sirve como mecanismo de retardo
+// controlado.
+//
+// sync/source-time solo es comparable de verdad entre dos capas si sus fuentes comparten epoch de
+// PTS (mismo codificador, o <wallclock-timestamps> activado en ambas) - ver BUILD.md. Si no lo
+// comparten, la resta sigue siendo un numero, pero no significa lo que este comando asume.
 std::wstring relink_signal_command(command_context& ctx)
 {
     auto parse_channel_layer = [](const std::wstring& spec) {
@@ -408,48 +414,42 @@ std::wstring relink_signal_command(command_context& ctx)
     const auto& chan1 = ctx.channels->at(ch1 - 1);
     const auto& chan2 = ctx.channels->at(ch2 - 1);
 
-    auto read_absolute_pts = [](const core::monitor::state& st, int layer) -> std::optional<double> {
-        const auto time_key   = "layer/" + std::to_string(layer) + "/foreground/file/time";
-        const auto origin_key = "layer/" + std::to_string(layer) + "/foreground/file/origin_start_time";
+    auto read_source_time = [](const core::monitor::state& st, int layer) -> std::optional<double> {
+        const auto key = "layer/" + std::to_string(layer) + "/foreground/sync/source-time";
 
-        auto to_double = [](const core::monitor::data_t& v) {
-            return boost::apply_visitor(
-                [](auto&& value) -> double {
-                    using T = std::decay_t<decltype(value)>;
+        for (const auto& p : st) {
+            if (p.first != key || p.second.empty())
+                continue;
+
+            const auto value = boost::apply_visitor(
+                [](auto&& v) -> double {
+                    using T = std::decay_t<decltype(v)>;
                     if constexpr (std::is_arithmetic<T>::value) {
-                        return static_cast<double>(value);
+                        return static_cast<double>(v);
                     } else {
-                        return 0.0;
+                        return -1.0;
                     }
                 },
-                v);
-        };
+                p.second[0]);
 
-        std::optional<double> pts;
-        std::optional<double> origin;
-        for (const auto& p : st) {
-            if (p.second.empty())
-                continue;
-            if (p.first == time_key) {
-                pts = to_double(p.second[0]);
-            } else if (p.first == origin_key) {
-                origin = to_double(p.second[0]);
-            }
+            // -1.0 es el centinela explicito de "sin PTS utilizable" (ver update_state() en
+            // av_producer.cpp) - no un valor real que restar.
+            if (value < 0.0)
+                return std::nullopt;
+
+            return value;
         }
 
-        if (!pts || !origin)
-            return std::nullopt;
-
-        return *pts + *origin;
+        return std::nullopt;
     };
 
-    const auto abs1 = read_absolute_pts(chan1.raw_channel->state(), l1);
-    const auto abs2 = read_absolute_pts(chan2.raw_channel->state(), l2);
+    const auto abs1 = read_source_time(chan1.raw_channel->state(), l1);
+    const auto abs2 = read_source_time(chan2.raw_channel->state(), l2);
 
     if (!abs1 || !abs2) {
         CASPAR_THROW_EXCEPTION(
             caspar_exception()
-            << msg_info(L"RELINK_SIGNAL: file/origin_start_time no disponible todavia en una de las dos capas"));
+            << msg_info(L"RELINK_SIGNAL: sync/source-time no disponible todavia en una de las dos capas"));
     }
 
     const double diff_seconds = *abs1 - *abs2;
