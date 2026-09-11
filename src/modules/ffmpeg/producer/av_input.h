@@ -40,8 +40,25 @@ class Input
     bool eof() const;
     void seek(int64_t ts, bool flush = true);
 
+    /// How many times the read thread has reopened this input after a failure.
+    ///
+    /// Live only: a file that fails to read is a real error, and reconnecting to one would
+    /// loop forever on a bad disk. See `is_live_` and `run_read_loop`.
+    int64_t reconnects() const { return reconnects_.load(); }
+
+    /// True once since the last call: the stream restarted, so anything downstream that
+    /// assumes a continuous timeline -- the filter graph in particular -- has to be rebuilt.
+    /// `vf_fps` never re-seeds its output counter on its own, so without this a reconnected
+    /// stream makes it drop or duplicate every frame indefinitely.
+    bool take_discontinuity() { return discontinuity_.exchange(false); }
+
   private:
     void internal_reset();
+    void run_read_loop();
+    bool is_live() const;
+
+    std::atomic<int64_t> reconnects_{0};
+    std::atomic<bool>    discontinuity_{false};
 
     std::optional<bool> seekable_;
 
