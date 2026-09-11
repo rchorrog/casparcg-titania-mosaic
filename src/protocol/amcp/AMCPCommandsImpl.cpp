@@ -475,8 +475,23 @@ std::wstring relink_signal_command(command_context& ctx)
 
     const double diff_seconds = *abs1 - *abs2;
 
-    if (std::abs(diff_seconds) < 0.001) {
-        return L"202 RELINK_SIGNAL OK\r\n";
+    // Por debajo de un frame no hay nada que corregir: PAUSE trabaja en frames enteros.
+    const double MIN_CORRECTABLE_S = 0.04;
+    // Techo de cordura. El PTS de MPEG-TS es de 33 bits a 90 kHz, asi que da la vuelta cada
+    // ~95443 s (26,5 h): si una de las dos capas ya ha pasado por el wrap y la otra no, la resta
+    // da un disparate. Sin este limite el comando pausaria una senal durante horas. Tambien
+    // protege del caso de dos capas que no son pareja real (contenidos distintos).
+    const double MAX_CORRECTABLE_S = 10.0;
+
+    if (std::abs(diff_seconds) < MIN_CORRECTABLE_S) {
+        return L"201 RELINK_SIGNAL OK\r\nYa sincronizadas (" + std::to_wstring(diff_seconds) + L" s)\r\n";
+    }
+
+    if (std::abs(diff_seconds) > MAX_CORRECTABLE_S) {
+        CASPAR_THROW_EXCEPTION(caspar_exception()
+                                << msg_info(L"RELINK_SIGNAL: desfase de " + std::to_wstring(diff_seconds) +
+                                            L" s fuera de rango (maximo " + std::to_wstring(MAX_CORRECTABLE_S) +
+                                            L" s). Wrap de PTS, o las dos capas no son pareja."));
     }
 
     const bool                              first_is_ahead = diff_seconds > 0;
@@ -492,7 +507,11 @@ std::wstring relink_signal_command(command_context& ctx)
         ahead_stage->resume(ahead_layer);
     }).detach();
 
-    return L"202 RELINK_SIGNAL OK\r\n";
+    // Se devuelve lo que ha hecho, no un OK a secas: durante la puesta en marcha el comando
+    // devolvia 202 OK tanto si pausaba como si no habia nada que pausar, y desde fuera era
+    // indistinguible de "no funciona".
+    return L"201 RELINK_SIGNAL OK\r\nPausando " + std::to_wstring(first_is_ahead ? ch1 : ch2) + L"-" +
+           std::to_wstring(ahead_layer) + L" durante " + std::to_wstring(delay_seconds) + L" s\r\n";
 }
 
 std::wstring stop_command(command_context& ctx)
