@@ -26,7 +26,7 @@ import wave
 
 BLOCK_S             = 0.04   # 40 ms = 1 frame a 25 fps, la resolucion a la que se puede corregir
 DB_FLOOR            = -90.0
-MAX_LAG_S           = 5.0
+MAX_LAG_S           = 10.0   # ancho: al desfase real hay que sumarle el de captura (ver capture_pair.sh)
 PEAK_GUARD_BLOCKS   = 3      # entorno del pico a ignorar al buscar el segundo mejor
 MIN_OVERLAP_BLOCKS  = 25     # menos de 1 s de solape no es una medida
 MIN_ENVELOPE_SD_DB  = 2.0    # por debajo de esto la envolvente es plana: silencio o tono constante
@@ -154,6 +154,10 @@ def main():
           % (offset_s, offset_s / BLOCK_S))
     print("   (positivo = backup llega despues, o sea muestra contenido mas viejo: para alinear,")
     print("    habria que pausar MAIN ese tiempo)")
+    if not common_axis and not (t_a or t_b):
+        print("   OJO: con capturas separadas este valor incluye el desfase de arranque de los dos")
+        print("   ffmpeg (< ~1 s). El veredicto de abajo no depende de eso; el valor exacto saldra")
+        print("   por OSC, donde ambas series vienen del mismo tick de canal.")
 
     print()
     if sd_a < MIN_ENVELOPE_SD_DB or sd_b < MIN_ENVELOPE_SD_DB:
