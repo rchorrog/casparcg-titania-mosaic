@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Mide el desfase real entre dos capturas del mismo programa, por correlacion de audio.
 
+    correlate_audio.py PAR.wav                      # 2 canales: ch0=main, ch1=backup
     correlate_audio.py MAIN.wav BACKUP.wav [T_MAIN T_BACKUP]
 
-T_MAIN/T_BACKUP son los instantes absolutos (epoch, segundos) en que empieza cada captura, tal
-como los saca `capture_pair.sh` del .mka con timestamps de reloj de pared. Sin ellos se asume que
-ambas capturas arrancaron a la vez, lo que anade a la medida el desfase de arranque de los dos
-procesos (decimas de segundo) - suficiente para decidir si la via es viable, no para el valor
-exacto.
+La forma recomendada es la primera: un unico WAV estereo generado por capture_pair.sh, donde los
+dos audios ya vienen alineados en el mismo eje temporal porque los captura un solo ffmpeg con
+amerge. Asi no hay que reconciliar dos relojes ni fiarse de timestamps de contenedor.
+
+La segunda forma (dos ficheros) queda para capturas hechas por separado. T_MAIN/T_BACKUP son los
+instantes absolutos (epoch, segundos) de inicio de cada una; sin ellos se asume arranque
+simultaneo, lo que anade el desfase de arranque de los dos procesos a la medida.
 
 Por que audio y no PTS: comparar marcas de tiempo entre dos codificadores independientes no
 funciona (cada uno arranca su epoch por su cuenta; y con wallclock-timestamps la marca pasa a ser
@@ -31,8 +34,8 @@ MIN_PEAK            = 0.5
 MIN_PEAK_RATIO      = 1.3    # cuanto tiene que destacar el pico sobre el segundo mejor
 
 
-def read_envelope(path):
-    """WAV PCM 16 bits -> envolvente en dBFS, un valor por bloque de 40 ms.
+def read_envelope(path, channel=0):
+    """WAV PCM 16 bits -> envolvente en dBFS del canal indicado, un valor por bloque de 40 ms.
 
     En dB a proposito: es la misma magnitud que publica CasparCG por OSC
     (mixer/layer/L/audio/peak_mono), asi que lo que se valide aqui vale tal cual para la version
@@ -45,6 +48,8 @@ def read_envelope(path):
                      % (path, w.getsampwidth()))
         rate     = w.getframerate()
         channels = w.getnchannels()
+        if channel >= channels:
+            sys.exit("%s: se pidio el canal %d pero el fichero tiene %d" % (path, channel, channels))
         block    = int(round(rate * BLOCK_S))
         env      = []
         while True:
@@ -53,7 +58,7 @@ def read_envelope(path):
                 break
             samples = struct.unpack('<%dh' % (len(raw) // 2), raw)
             if channels > 1:
-                samples = samples[::channels]
+                samples = samples[channel::channels]
             acc = 0
             for s in samples:
                 acc += s * s
@@ -93,21 +98,34 @@ def correlate(a, b, max_lag):
 
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         sys.exit(__doc__)
 
-    path_a, path_b = sys.argv[1], sys.argv[2]
-    t_a = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
-    t_b = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+    if len(sys.argv) == 2:
+        # Un unico WAV estereo de capture_pair.sh: ch0=main, ch1=backup, ya en el mismo eje.
+        path_a = path_b = sys.argv[1]
+        t_a = t_b = 0.0
+        _, env_a = read_envelope(path_a, 0)
+        _, env_b = read_envelope(path_b, 1)
+        label_a, label_b = path_a + " ch0", path_b + " ch1"
+        common_axis = True
+    else:
+        path_a, path_b = sys.argv[1], sys.argv[2]
+        t_a = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+        t_b = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+        _, env_a = read_envelope(path_a)
+        _, env_b = read_envelope(path_b)
+        label_a, label_b = path_a, path_b
+        common_axis = False
 
-    _, env_a = read_envelope(path_a)
-    _, env_b = read_envelope(path_b)
-    sd_a, _  = stddev(env_a)
-    sd_b, _  = stddev(env_b)
+    sd_a, _ = stddev(env_a)
+    sd_b, _ = stddev(env_b)
 
-    print("MAIN   %-24s %5d bloques (%.1f s)  sd=%.1f dB" % (path_a, len(env_a), len(env_a) * BLOCK_S, sd_a))
-    print("BACKUP %-24s %5d bloques (%.1f s)  sd=%.1f dB" % (path_b, len(env_b), len(env_b) * BLOCK_S, sd_b))
-    if t_a or t_b:
+    print("MAIN   %-28s %5d bloques (%.1f s)  sd=%.1f dB" % (label_a, len(env_a), len(env_a) * BLOCK_S, sd_a))
+    print("BACKUP %-28s %5d bloques (%.1f s)  sd=%.1f dB" % (label_b, len(env_b), len(env_b) * BLOCK_S, sd_b))
+    if common_axis:
+        print("eje temporal: comun por construccion (un solo ffmpeg con amerge)")
+    elif t_a or t_b:
         print("start_time: main=%.3f backup=%.3f  (diferencia %+.3f s)" % (t_a, t_b, t_b - t_a))
     else:
         print("start_time: no facilitado - se asume arranque simultaneo (+-decimas de segundo)")
