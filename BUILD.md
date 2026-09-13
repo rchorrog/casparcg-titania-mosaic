@@ -13,6 +13,40 @@ este fichero, el origen y el porqué de cada cambio no se puede reconstruir solo
 - Confirmado por AMCP (`VERSION` → `2.5.0 N/A Stable`) que coincide con las constantes de
   versión (`CONFIG_VERSION_MAJOR/MINOR/TAG`) del tag `v2.5.0-stable` en el repo `server`.
 
+## Fuente de CEF: build sin `sysroot` (mko1989/highascg), no el oficial
+
+**Desde el commit `ef2c41f` (2026-09-13), `src/CMakeModules/Bootstrap_Linux.cmake` descarga CEF
+de `https://github.com/mko1989/highascg/releases/download/v.142/...` en vez del mirror oficial
+`CasparCG/dependencies`.** Es el mismo CEF exacto, misma versión, mismo commit
+(`142.0.17+g60aac24+chromium-142.0.7444.176`) — la única diferencia es que este build se compiló
+**sin `sysroot`**.
+
+- **Síntoma**: `SIGILL` recurrente del proceso principal de CasparCG, backtrace dentro de
+  `libcef.so` (ver entrada 2 más abajo, `OnMemoryDump`/memory-infra) — la mitigación de esa
+  entrada reduce la frecuencia pero **no lo elimina del todo**. Confirmado el mismo offset exacto
+  de crash (`libcef.so + 0x77270aa`) en capturas de coredump reales separadas por más de dos
+  semanas, antes y después de aplicar otros parches — descarta que sea algo introducido por
+  cambios propios.
+- **Causa raíz real, documentada por la comunidad**: los builds oficiales de CEF se compilan
+  con `sysroot`, lo que **crashea en hosts con glibc >= 2.33** — Ubuntu 24.04/Noble (lo que
+  corren mosaic1/2/4/5) trae glibc 2.39. Hilo de referencia, con el mismo offset de crash
+  reportado en máquinas de otros usuarios:
+  https://casparcgforum.org/t/casparcg-crashes-randomly-on-ubuntu-24-04/7537
+- **Cómo se encontró**: buscando directamente en https://casparcgforum.org (`site:casparcgforum.org
+  SIGILL crash CEF`, variantes) — la comunidad ya había diagnosticado y resuelto este bug antes de
+  que lo tocásemos nosotros. **Lección para la próxima vez que un crash de CEF/Chromium no dé
+  símbolos**: mirar el foro antes de asumir que hay que compilar CEF desde cero o cambiar de
+  versión de CasparCG a ciegas — ver `docs/leccion-sigill-cef-sysroot-buscar-en-foro.md`.
+- **Verificación tras el swap**: `use-gl=disabled` sigue presente en el `gpu-process` real,
+  `libcef.so` carga desde la ruta esperada (confirmado vía `/proc/<pid>/maps`). Desplegado y en
+  ventana de vigilancia en mosaic2 (2026-09-13, desde las 11:52 UTC) y mosaic5 (desde las 12:23
+  UTC) — pendiente de confirmar 24h sin `SIGILL` en ninguno de los dos antes de extender a
+  mosaic1/mosaic4.
+- **Pendiente**: la Fase 4B de `docs/setup-desde-cero.sh` (instalación del `.deb` oficial) sigue
+  usando el CEF con `sysroot` sin corregir — no se usa en producción (que va por Fase 4C, ya
+  corregida al depender de este mismo `Bootstrap_Linux.cmake`), pero si alguna vez se usa esa vía
+  en un host Noble, se recomienda aplicar el mismo cambio de fuente de CEF a mano.
+
 ## Parches aplicados, en orden
 
 1. **`patches/osc-audio-per-layer-on-v2.5.0-stable.patch`** (commit `2d29225`) — expone el pico
