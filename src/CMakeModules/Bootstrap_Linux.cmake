@@ -61,8 +61,15 @@ if (ENABLE_HTML)
     else()
         casparcg_add_external_project(cef)
         ExternalProject_Add(cef
-            URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_142.0.17+g60aac24+chromium-142.0.7444.176_linux64_minimal.tar.bz2
-            URL_HASH SHA256=1d89e19b2f446105f9a1fe6fdc96bced86249b5884241dcc4013b7c94dabf424
+            # Build sin sysroot de la comunidad (mko1989/highascg), no el oficial de CasparCG/dependencies.
+            # Mismo CEF 142.0.17+g60aac24+chromium-142.0.7444.176 exacto, pero el oficial se compila
+            # con sysroot y crashea (SIGILL en OnMemoryDump/malloc_dump_provider, dentro de libcef.so)
+            # en hosts con glibc >= 2.33 (Ubuntu 24.04/Noble, lo que corren mosaic1/2/4/5) - confirmado
+            # como bug conocido en https://casparcgforum.org/t/casparcg-crashes-randomly-on-ubuntu-24-04/7537,
+            # con el mismo offset de crash reportado en distintas maquinas. Ver tambien
+            # mosaic4-casparcg-sigill-crash.md (memoria del proyecto) para el historial completo.
+            URL https://github.com/mko1989/highascg/releases/download/v.142/cef_binary_142.0.17%2Bg60aac24%2Bchromium-142.0.7444.176_linux64_minimal.tar.bz2
+            URL_HASH SHA256=2a03fa6b9da0e374fb318903d9502e098ac91ba2ec5be83e96ae076b5aa63cc9
             DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
             CMAKE_ARGS -DUSE_SANDBOX=Off
             INSTALL_COMMAND ""
