@@ -1448,6 +1448,93 @@ std::future<std::wstring> mixer_volume_command(command_context& ctx)
         [](frame_transform& t, double value) { t.audio_transform.volume = value; });
 }
 
+// MIXER c-l AUDIO                                         consulta del ruteo actual
+// MIXER c-l AUDIO MAP <out>=<in>[:<gain>] ... [dur [tween]]  sustituye la matriz (salidas no listadas en silencio)
+// MIXER c-l AUDIO PAIR <in_L> <in_R> [dur [tween]]          atajo: in_L -> salida 1, in_R -> salida 2
+// MIXER c-l AUDIO RESET [dur [tween]]                       vuelve a identidad (comportamiento original)
+// Canales 1-based, de 1 a core::audio_route_channels.
+std::future<std::wstring> mixer_audio_command(command_context& ctx)
+{
+    if (ctx.parameters.empty()) {
+        auto transform = get_current_transform(ctx).share();
+        return std::async(std::launch::deferred, [transform]() -> std::wstring {
+            const auto& audio = transform.get().audio_transform;
+            if (!audio.routed)
+                return L"201 MIXER OK\r\nIDENTITY\r\n";
+
+            std::wostringstream cells;
+            for (int o = 0; o < core::audio_route_channels; ++o) {
+                for (int i = 0; i < core::audio_route_channels; ++i) {
+                    if (audio.matrix[o][i] != 0.0f) {
+                        if (cells.tellp() > 0)
+                            cells << L" ";
+                        cells << (o + 1) << L"=" << (i + 1) << L":" << audio.matrix[o][i];
+                    }
+                }
+            }
+            return L"201 MIXER OK\r\n" + cells.str() + L"\r\n";
+        });
+    }
+
+    transforms_applier transforms(ctx);
+
+    auto parse_channel = [](const std::wstring& str) {
+        const int channel = boost::lexical_cast<int>(str);
+        if (channel < 1 || channel > core::audio_route_channels)
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Audio channel out of range: " + str));
+        return channel - 1;
+    };
+
+    const auto   mode   = boost::to_upper_copy(ctx.parameters.at(0));
+    size_t       next   = 1;
+    bool         routed = true;
+    core::audio_matrix matrix{};
+
+    if (mode == L"RESET") {
+        routed = false;
+        matrix = core::audio_identity_matrix();
+    } else if (mode == L"PAIR") {
+        matrix[0][parse_channel(ctx.parameters.at(1))] = 1.0f;
+        matrix[1][parse_channel(ctx.parameters.at(2))] = 1.0f;
+        next = 3;
+    } else if (mode == L"MAP") {
+        for (; next < ctx.parameters.size() && ctx.parameters[next].find(L'=') != std::wstring::npos; ++next) {
+            const auto& cell  = ctx.parameters[next];
+            const auto  eq    = cell.find(L'=');
+            const auto  colon = cell.find(L':', eq);
+            const int   out   = parse_channel(cell.substr(0, eq));
+            const int   in    = parse_channel(cell.substr(eq + 1, colon == std::wstring::npos ? colon : colon - eq - 1));
+            const float gain  = colon == std::wstring::npos ? 1.0f : boost::lexical_cast<float>(cell.substr(colon + 1));
+            matrix[out][in] += gain;
+        }
+        if (next == 1)
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"MIXER AUDIO MAP requires at least one <out>=<in> cell"));
+    } else {
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Unknown MIXER AUDIO mode: " + mode));
+    }
+
+    if (routed && core::is_identity(matrix)) {
+        routed = false;
+        matrix = core::audio_identity_matrix();
+    }
+
+    const int          duration = ctx.parameters.size() > next ? std::stoi(ctx.parameters[next]) : 0;
+    const std::wstring tween    = ctx.parameters.size() > next + 1 ? ctx.parameters[next + 1] : L"linear";
+
+    transforms.add(stage::transform_tuple_t(
+        ctx.layer_index(),
+        [=](frame_transform transform) -> frame_transform {
+            transform.audio_transform.routed = routed;
+            transform.audio_transform.matrix = matrix;
+            return transform;
+        },
+        duration,
+        tween));
+    transforms.apply();
+
+    return make_ready_future<std::wstring>(L"202 MIXER OK\r\n");
+}
+
 std::wstring mixer_mastervolume_command(command_context& ctx)
 {
     if (ctx.parameters.empty()) {
@@ -1900,6 +1987,7 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"Mixer Commands", L"MIXER ROTATION", mixer_rotation_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER PERSPECTIVE", mixer_perspective_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER VOLUME", mixer_volume_command, 0);
+    repo->register_channel_command(L"Mixer Commands", L"MIXER AUDIO", mixer_audio_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER MASTERVOLUME", mixer_mastervolume_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER GRID", mixer_grid_command, 1);
     repo->register_channel_command(L"Mixer Commands", L"MIXER COMMIT", mixer_commit_command, 0);

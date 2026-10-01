@@ -113,10 +113,30 @@ struct image_transform final
 bool operator==(const image_transform& lhs, const image_transform& rhs);
 bool operator!=(const image_transform& lhs, const image_transform& rhs);
 
+constexpr int audio_route_channels = 16;
+
+// gains[out][in]: canal de salida <- suma ponderada de los canales de entrada de la layer
+using audio_matrix = std::array<std::array<float, audio_route_channels>, audio_route_channels>;
+
+constexpr audio_matrix audio_identity_matrix()
+{
+    audio_matrix result{};
+    for (int n = 0; n < audio_route_channels; ++n)
+        result[n][n] = 1.0f;
+    return result;
+}
+
+bool is_identity(const audio_matrix& matrix);
+
 struct audio_transform final
 {
     double volume = 1.0;
     bool   immediate_volume = false;  // When false, intra-frame samples are ramped from previous volume in audio mixer
+
+    // Ruteo por canal (MIXER ... AUDIO). Con routed == false la matriz se ignora y se trata como identidad,
+    // de forma que el mixer sigue el camino original sin coste extra.
+    bool         routed = false;
+    audio_matrix matrix = audio_identity_matrix();
 
     audio_transform& operator*=(const audio_transform& other);
     audio_transform  operator*(const audio_transform& other) const;

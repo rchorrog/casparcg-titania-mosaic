@@ -58,6 +58,7 @@ struct audio_mixer::impl
     std::vector<audio_item>                     items_;
     std::map<const void*, std::vector<int32_t>> audio_streams_;    // For audio cadence handling
     std::map<const void*, double>               previous_volumes_; // For audio transitions
+    std::map<const void*, audio_matrix>         previous_matrices_; // Ruteo por canal (MIXER ... AUDIO), para rampa
     video_format_desc                           format_desc_;
     std::atomic<float>                          master_volume_{1.0f};
     spl::shared_ptr<diagnostics::graph>         graph_;
@@ -94,6 +95,48 @@ struct audio_mixer::impl
 
     void pop() { transform_stack_.pop(); }
 
+    // Aplica la matriz de ruteo a un bloque entrelazado de dst_size muestras, interpolando linealmente las
+    // ganancias de "from" a "to" a lo largo del bloque (from == to => sin rampa). Los canales por encima de
+    // audio_route_channels pasan sin tocar.
+    template <typename Fetch>
+    std::vector<double> route_samples(Fetch& fetch, size_t dst_size, const audio_matrix& from, const audio_matrix& to)
+    {
+        struct cell
+        {
+            int    out;
+            int    in;
+            double from;
+            double to;
+        };
+
+        const int routed_channels = std::min(channels_, audio_route_channels);
+
+        std::vector<cell> cells;
+        for (int o = 0; o < routed_channels; ++o)
+            for (int i = 0; i < routed_channels; ++i)
+                if (from[o][i] != 0.0f || to[o][i] != 0.0f)
+                    cells.push_back(cell{o, i, from[o][i], to[o][i]});
+
+        const size_t total_frames = dst_size / channels_;
+
+        std::vector<double> result(dst_size, 0.0);
+        for (size_t f = 0; f < total_frames; ++f) {
+            const size_t base = f * channels_;
+
+            double position = total_frames > 1 ? static_cast<double>(f) / static_cast<double>(total_frames - 1) : 1.0;
+
+            for (const auto& c : cells) {
+                const double gain = c.from + (c.to - c.from) * position;
+                result[base + c.out] += gain * fetch(base + c.in);
+            }
+
+            for (int ch = routed_channels; ch < channels_; ++ch)
+                result[base + ch] = fetch(base + ch);
+        }
+
+        return result;
+    }
+
     void set_master_volume(float volume) { master_volume_ = volume; }
 
     float get_master_volume() { return master_volume_; }
@@ -103,6 +146,7 @@ struct audio_mixer::impl
         if (format_desc_ != format_desc) {
             audio_streams_.clear();
             previous_volumes_.clear();
+            previous_matrices_.clear();
 
             format_desc_ = format_desc;
             channels_    = format_desc.audio_channels;
@@ -156,6 +200,7 @@ struct audio_mixer::impl
 
         std::map<const void*, std::vector<int32_t>> next_audio_streams;
         std::map<const void*, double>               next_volumes;
+        std::map<const void*, audio_matrix>         next_matrices;
 
         for (auto& item : items) {
             auto ptr       = item.samples.data();
@@ -189,14 +234,11 @@ struct audio_mixer::impl
             // Store current volume for next frame
             next_volumes[item.tag] = item.transform.volume;
 
-            // Sample collection and volume application loop
-            for (auto n = 0; n < dst_size; ++n) {
-                double sample_value = 0.0;
-
+            auto fetch_sample = [&](size_t n) -> double {
                 if (last_ptr && n < last_size) {
-                    sample_value = static_cast<double>(last_ptr[n]);
+                    return static_cast<double>(last_ptr[n]);
                 } else if (n < last_size + item_size) {
-                    sample_value = static_cast<double>(ptr[n - last_size]);
+                    return static_cast<double>(ptr[n - last_size]);
                 } else {
                     // If we run out of samples, hold the last sample value per channel
                     int channel_pos = n % channels_;
@@ -204,8 +246,33 @@ struct audio_mixer::impl
                     if (offset < 0) {
                         offset = channel_pos;
                     }
-                    sample_value = static_cast<double>(ptr[offset]);
+                    return static_cast<double>(ptr[offset]);
                 }
+            };
+
+            // Ruteo por canal (MIXER ... AUDIO): se pre-calcula el buffer ruteado de la layer y el bucle de
+            // volumen lo consume en lugar de las muestras crudas. Sin ruteo (ni actual ni en el frame
+            // anterior) no se entra aquí y el camino es el original.
+            std::vector<double> routed;
+            {
+                auto prev_matrix_it = previous_matrices_.find(item.tag);
+                if (item.transform.routed || prev_matrix_it != previous_matrices_.end()) {
+                    const auto  identity = audio_identity_matrix();
+                    const auto& current  = item.transform.routed ? item.transform.matrix : identity;
+                    const auto& previous = prev_matrix_it != previous_matrices_.end() ? prev_matrix_it->second : current;
+                    const bool  ramp     = !item.transform.immediate_volume && previous != current;
+
+                    if (item.transform.routed) {
+                        next_matrices[item.tag] = current;
+                    }
+
+                    routed = route_samples(fetch_sample, dst_size, ramp ? previous : current, current);
+                }
+            }
+
+            // Sample collection and volume application loop
+            for (auto n = 0; n < dst_size; ++n) {
+                double sample_value = routed.empty() ? fetch_sample(n) : routed[n];
 
                 double applied_volume = item.transform.volume;
 
@@ -255,7 +322,8 @@ struct audio_mixer::impl
             }
         }
 
-        previous_volumes_ = std::move(next_volumes);
+        previous_volumes_  = std::move(next_volumes);
+        previous_matrices_ = std::move(next_matrices);
         audio_streams_    = std::move(next_audio_streams);
 
         auto master_volume = master_volume_.load();

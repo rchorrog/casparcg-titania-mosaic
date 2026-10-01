@@ -153,9 +153,35 @@ bool operator!=(const image_transform& lhs, const image_transform& rhs) { return
 
 // audio_transform
 
+bool is_identity(const audio_matrix& matrix)
+{
+    for (int o = 0; o < audio_route_channels; ++o)
+        for (int i = 0; i < audio_route_channels; ++i)
+            if (std::abs(matrix[o][i] - (o == i ? 1.0f : 0.0f)) > 1e-6f)
+                return false;
+    return true;
+}
+
 audio_transform& audio_transform::operator*=(const audio_transform& other)
 {
     volume *= other.volume;
+
+    // this es el transform exterior (layer) y other el interior (producer): out = this.M * (other.M * in)
+    if (other.routed) {
+        if (routed) {
+            audio_matrix result{};
+            for (int o = 0; o < audio_route_channels; ++o)
+                for (int k = 0; k < audio_route_channels; ++k)
+                    if (matrix[o][k] != 0.0f)
+                        for (int i = 0; i < audio_route_channels; ++i)
+                            result[o][i] += matrix[o][k] * other.matrix[k][i];
+            matrix = result;
+        } else {
+            matrix = other.matrix;
+            routed = true;
+        }
+    }
+
     return *this;
 }
 
@@ -173,10 +199,21 @@ audio_transform audio_transform::tween(double                 time,
     audio_transform result;
     result.volume = do_tween(time, source.volume, dest.volume, duration, tween);
 
+    if (source.routed || dest.routed) {
+        for (int o = 0; o < audio_route_channels; ++o)
+            for (int i = 0; i < audio_route_channels; ++i)
+                result.matrix[o][i] = static_cast<float>(
+                    do_tween(time, source.matrix[o][i], dest.matrix[o][i], duration, tween));
+        result.routed = !is_identity(result.matrix);
+    }
+
     return result;
 }
 
-bool operator==(const audio_transform& lhs, const audio_transform& rhs) { return eq(lhs.volume, rhs.volume); }
+bool operator==(const audio_transform& lhs, const audio_transform& rhs)
+{
+    return eq(lhs.volume, rhs.volume) && lhs.routed == rhs.routed && (!lhs.routed || lhs.matrix == rhs.matrix);
+}
 
 bool operator!=(const audio_transform& lhs, const audio_transform& rhs) { return !(lhs == rhs); }
 
