@@ -93,6 +93,9 @@ struct mixer::impl
         auto result = image_mixer_->render(format_desc);
         auto audio  = audio_mixer_(format_desc, nb_samples);
 
+        // Estado nuevo en cada frame: una layer que deja de tener audio (STOP, CLEAR, fuente sin audio) deja de
+        // publicar su peak en vez de repetir el último valor medido.
+        state_          = monitor::state{};
         state_["audio"] = audio_mixer_.state();
 
         // ── Per-layer audio peak → OSC /channel/N/mixer/layer/L/audio/peak/CH ──

@@ -87,7 +87,9 @@ struct audio_mixer::impl
 
     void visit(const const_frame& frame)
     {
-        if (transform_stack_.top().volume < 0.002 || !frame.audio_data())
+        // Las layers con volumen 0 también entran: hay que medirlas (vúmetro pre-fader). La mezcla se las
+        // salta en mix().
+        if (!frame.audio_data())
             return;
 
         items_.push_back(std::move(audio_item{frame.stream_tag(), transform_stack_.top(), frame.audio_data()}));
@@ -234,6 +236,10 @@ struct audio_mixer::impl
             // Store current volume for next frame
             next_volumes[item.tag] = item.transform.volume;
 
+            // Layer muda en este frame y en el anterior: ya se ha medido, no se mezcla. Sí se mantiene la
+            // cadencia y el estado de volumen/matriz, para que al subirla entre con rampa y sin hueco.
+            const bool muted = item.transform.volume < 0.002 && previous_volume < 0.002;
+
             auto fetch_sample = [&](size_t n) -> double {
                 if (last_ptr && n < last_size) {
                     return static_cast<double>(last_ptr[n]);
@@ -266,12 +272,14 @@ struct audio_mixer::impl
                         next_matrices[item.tag] = current;
                     }
 
-                    routed = route_samples(fetch_sample, dst_size, ramp ? previous : current, current);
+                    if (!muted) {
+                        routed = route_samples(fetch_sample, dst_size, ramp ? previous : current, current);
+                    }
                 }
             }
 
             // Sample collection and volume application loop
-            for (auto n = 0; n < dst_size; ++n) {
+            for (auto n = 0; !muted && n < dst_size; ++n) {
                 double sample_value = routed.empty() ? fetch_sample(n) : routed[n];
 
                 double applied_volume = item.transform.volume;
