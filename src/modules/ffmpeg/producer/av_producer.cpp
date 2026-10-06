@@ -138,6 +138,11 @@ class Decoder
     /// it cannot be done anywhere later.
     std::atomic<bool> discontinuity = {false};
 
+    /// SOURCE timestamp (AV_TIME_BASE) of the first frame after the jump, i.e. where the new
+    /// timeline starts. The filter graph must be re-seeded HERE, not at input_->start_time:
+    /// re-seeding at the start of the stream recreates the very gap the reset is meant to clear.
+    std::atomic<int64_t> discontinuity_time = {AV_NOPTS_VALUE};
+
     /// Latest decoded SOURCE timestamp, in AV_TIME_BASE units; AV_NOPTS_VALUE until the first
     /// frame carries one. Written by the decode thread, read by the producer thread for state.
     std::atomic<int64_t> source_time = {AV_NOPTS_VALUE};
@@ -266,7 +271,8 @@ class Decoder
                         if (next_pts != AV_NOPTS_VALUE && av_frame->pts != AV_NOPTS_VALUE) {
                             const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
                             if (std::abs(av_frame->pts - next_pts) > threshold) {
-                                discontinuity = true;
+                                discontinuity_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
+                                discontinuity      = true;
                             }
                         }
 
@@ -347,6 +353,9 @@ class Decoder
     /// True once since the last call: this stream's timeline jumped. Consumed by the producer
     /// thread, which rebuilds the filter graph so `vf_fps` re-seeds its output counter.
     bool take_discontinuity() { return discontinuity.exchange(false); }
+
+    /// Where the new timeline starts (see `discontinuity_time`); AV_NOPTS_VALUE if unknown.
+    int64_t take_discontinuity_time() { return discontinuity_time.exchange(AV_NOPTS_VALUE); }
 
     /// Source-side clock, AV_TIME_BASE units. See the write site for why this is not the same
     /// thing as `Frame::pts`.
@@ -1012,10 +1021,20 @@ struct AVProducer::Impl
                 // discontinuity needs the same treatment without moving the read position,
                 // which for a live input is not seekable anyway.
                 bool discontinuity = input_.take_discontinuity();
+                // Earliest new-timeline timestamp among the decoders that saw the jump;
+                // AV_NOPTS_VALUE when only Input reported (a real reconnect, which already
+                // renews input_->start_time).
+                int64_t resync_time = AV_NOPTS_VALUE;
                 for (auto& p : decoders_) {
                     // Every decoder is polled, not just the first to report -- `take_` clears
                     // the flag, and leaving one set would fire a second reset next tick.
-                    discontinuity = p.second.take_discontinuity() || discontinuity;
+                    if (p.second.take_discontinuity()) {
+                        discontinuity = true;
+                        const auto t  = p.second.take_discontinuity_time();
+                        if (t != AV_NOPTS_VALUE && (resync_time == AV_NOPTS_VALUE || t < resync_time)) {
+                            resync_time = t;
+                        }
+                    }
                 }
 
                 if (discontinuity) {
@@ -1037,7 +1056,12 @@ struct AVProducer::Impl
                     // desincronizados entre si tras reconectar. Seguro en este hilo (el mismo que
                     // posee input_).
                     origin_start_time_ = input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0;
-                    reset(input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0);
+                    // Re-seed `vf_fps`/`aresample` where the new timeline starts. Seeding at
+                    // input_->start_time (the PLAY's) made them pad the whole time since PLAY:
+                    // a tile frozen for hours and "aresample: Failed to compensate for
+                    // timestamp delta of <seconds since PLAY>" (mosaic1/4/6, 2026-10-05).
+                    reset(resync_time != AV_NOPTS_VALUE ? resync_time
+                                                        : (input_->start_time != AV_NOPTS_VALUE ? input_->start_time : 0));
                     frame = Frame{};
                     continue;
                 }
