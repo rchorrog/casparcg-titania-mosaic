@@ -20,8 +20,6 @@ extern "C" {
 #endif
 
 #include <array>
-#include <tbb/parallel_for.h>
-#include <tbb/parallel_invoke.h>
 
 #include <tuple>
 
@@ -64,48 +62,58 @@ core::mutable_frame make_frame(void*                            tag,
         frame.geometry() = core::frame_geometry::get_default(scale_mode);
     }
 
-    tbb::parallel_invoke(
-        [&]() {
-            if (video) {
-                for (int n = 0; n < static_cast<int>(pix_desc.planes.size()); ++n) {
-                    auto frame_plan_index = data_map.empty() ? n : data_map.at(n);
+    // Copia secuencial, sin tbb::parallel_invoke/parallel_for. Antes cada fila de cada plano era
+    // una tarea TBB: con tiles de mosaico (480x270 yuv420p, ~194 KB por frame) eso son ~540
+    // memcpy de 240-480 bytes repartidos entre hilos, y el coste de despertar/coordinar a los
+    // workers (que luego giran y hacen sched_yield) superaba con mucho al de copiar. Con 16 capas
+    // a 25 fps eran ~400 parallel_for/s: libtbb ~6% y parte del tiempo de kernel de CasparCG en
+    // perf (mosaic5, 14/10). Un memcpy por plano cuando las filas son contiguas en origen y
+    // destino; si no (linesize con padding o negativo), fila a fila.
+    if (video) {
+        for (int n = 0; n < static_cast<int>(pix_desc.planes.size()); ++n) {
+            auto        frame_plan_index = data_map.empty() ? n : data_map.at(n);
+            const auto& plane            = pix_desc.planes[n];
+            auto        dst              = frame.image_data(n).begin();
+            const auto  src              = video->data[frame_plan_index];
+            const auto  src_linesize     = video->linesize[frame_plan_index];
 
-                    tbb::parallel_for(0, pix_desc.planes[n].height, [&](int y) {
-                        std::memcpy(frame.image_data(n).begin() + y * pix_desc.planes[n].linesize,
-                                    video->data[frame_plan_index] + y * video->linesize[frame_plan_index],
-                                    pix_desc.planes[n].linesize);
-                    });
+            if (src_linesize == plane.linesize) {
+                std::memcpy(dst, src, static_cast<size_t>(plane.linesize) * plane.height);
+            } else {
+                for (int y = 0; y < plane.height; ++y) {
+                    std::memcpy(dst + y * plane.linesize, src + y * src_linesize, plane.linesize);
                 }
             }
-        },
-        [&]() {
-            if (audio) {
-                const int channel_count = 16;
-                frame.audio_data()      = std::vector<int32_t>(audio->nb_samples * channel_count, 0);
+        }
+    }
+
+    if (audio) {
+        const int channel_count = 16;
+        frame.audio_data()      = std::vector<int32_t>(audio->nb_samples * channel_count, 0);
 
 #if FFMPEG_NEW_CHANNEL_LAYOUT
-                auto source_channel_count = audio->ch_layout.nb_channels;
+        auto source_channel_count = audio->ch_layout.nb_channels;
 #else
-                auto source_channel_count = audio->channels;
+        auto source_channel_count = audio->channels;
 #endif
 
-                if (source_channel_count == channel_count) {
-                    std::memcpy(frame.audio_data().data(),
-                                reinterpret_cast<int32_t*>(audio->data[0]),
-                                sizeof(int32_t) * channel_count * audio->nb_samples);
-                } else {
-                    // This isn't pretty, but some callers may not provide 16 channels
+        if (source_channel_count == channel_count) {
+            std::memcpy(frame.audio_data().data(),
+                        reinterpret_cast<int32_t*>(audio->data[0]),
+                        sizeof(int32_t) * channel_count * audio->nb_samples);
+        } else {
+            // This isn't pretty, but some callers may not provide 16 channels
 
-                    auto dst = frame.audio_data().data();
-                    auto src = reinterpret_cast<int32_t*>(audio->data[0]);
-                    for (auto i = 0; i < audio->nb_samples; i++) {
-                        for (auto j = 0; j < std::min(channel_count, source_channel_count); ++j) {
-                            dst[i * channel_count + j] = src[i * source_channel_count + j];
-                        }
-                    }
+            auto       dst         = frame.audio_data().data();
+            auto       src         = reinterpret_cast<int32_t*>(audio->data[0]);
+            const auto copied_count = std::min(channel_count, source_channel_count);
+            for (auto i = 0; i < audio->nb_samples; i++) {
+                for (auto j = 0; j < copied_count; ++j) {
+                    dst[i * channel_count + j] = src[i * source_channel_count + j];
                 }
             }
-        });
+        }
+    }
 
     return frame;
 }
