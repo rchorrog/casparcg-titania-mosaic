@@ -33,6 +33,7 @@
 #include <boost/range/algorithm.hpp>
 
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <stack>
 #include <vector>
@@ -67,6 +68,10 @@ struct audio_mixer::impl
     bool                                        has_variable_cadence_{false};
     std::vector<int32_t>                        silence_buffer_;
     int                                         channels_{0};
+    // Buffers reutilizados entre ticks (antes se reservaban y ponían a cero en cada frame).
+    std::vector<double>                         mixed_;
+    std::vector<double>                         routed_;
+    std::vector<int64_t>                        peak_abs_;
 
     impl(spl::shared_ptr<diagnostics::graph> graph)
         : graph_(std::move(graph))
@@ -100,8 +105,14 @@ struct audio_mixer::impl
     // Aplica la matriz de ruteo a un bloque entrelazado de dst_size muestras, interpolando linealmente las
     // ganancias de "from" a "to" a lo largo del bloque (from == to => sin rampa). Los canales por encima de
     // audio_route_channels pasan sin tocar.
+    // Escribe en "result" (reutilizado entre llamadas: antes se reservaba un vector nuevo de
+    // dst_size doubles por layer ruteada y por frame).
     template <typename Fetch>
-    std::vector<double> route_samples(Fetch& fetch, size_t dst_size, const audio_matrix& from, const audio_matrix& to)
+    void route_samples(Fetch&              fetch,
+                       size_t              dst_size,
+                       const audio_matrix& from,
+                       const audio_matrix& to,
+                       std::vector<double>& result)
     {
         struct cell
         {
@@ -121,7 +132,7 @@ struct audio_mixer::impl
 
         const size_t total_frames = dst_size / channels_;
 
-        std::vector<double> result(dst_size, 0.0);
+        result.assign(dst_size, 0.0);
         for (size_t f = 0; f < total_frames; ++f) {
             const size_t base = f * channels_;
 
@@ -135,8 +146,6 @@ struct audio_mixer::impl
             for (int ch = routed_channels; ch < channels_; ++ch)
                 result[base + ch] = fetch(base + ch);
         }
-
-        return result;
     }
 
     void set_master_volume(float volume) { master_volume_ = volume; }
@@ -179,22 +188,40 @@ struct audio_mixer::impl
 
         auto items  = std::move(items_);
         auto result = std::vector<int32_t>(size_t(nb_samples) * channels_, 0);
-        auto mixed  = std::vector<double>(size_t(nb_samples) * channels_, 0.0f);
+        mixed_.assign(size_t(nb_samples) * channels_, 0.0);
 
         // ── Per-tag (per-layer) peak calculation — one peak per audio channel ──
+        // Máximo del valor absoluto en enteros recorriendo frame x canal, y una sola conversión a
+        // float por canal al final. Antes, por cada muestra: una división entera (i % nch) para
+        // saber el canal, conversión a float, abs y división en coma flotante — 16 canales x 1920
+        // muestras x capas, en cada frame. El resultado es el mismo.
         per_tag_peaks_.clear();
         for (const auto& item : items) {
             if (!item.samples.data()) continue;
             const int32_t* data    = item.samples.data();
             const size_t   sz      = item.samples.size();
             const int      nch     = std::max(1, channels_);
+            const size_t   frames  = sz / static_cast<size_t>(nch);
             auto&          slot    = per_tag_peaks_[item.tag];
             if (static_cast<int>(slot.size()) < nch)
                 slot.assign(nch, 0.0f);
-            for (size_t i = 0; i < sz; ++i) {
-                int   ch = static_cast<int>(i % static_cast<size_t>(nch));
-                float v  = std::abs(static_cast<float>(data[i])) /
-                           static_cast<float>(std::numeric_limits<int32_t>::max());
+
+            peak_abs_.assign(nch, 0);
+            for (size_t f = 0; f < frames; ++f) {
+                const int32_t* frame_data = data + f * nch;
+                for (int ch = 0; ch < nch; ++ch) {
+                    const int64_t a = std::abs(static_cast<int64_t>(frame_data[ch]));
+                    if (a > peak_abs_[ch]) peak_abs_[ch] = a;
+                }
+            }
+            for (size_t i = frames * nch; i < sz; ++i) { // resto incompleto, si lo hubiera
+                const int     ch = static_cast<int>(i - frames * nch);
+                const int64_t a  = std::abs(static_cast<int64_t>(data[i]));
+                if (a > peak_abs_[ch]) peak_abs_[ch] = a;
+            }
+            for (int ch = 0; ch < nch; ++ch) {
+                const float v = static_cast<float>(peak_abs_[ch]) /
+                                static_cast<float>(std::numeric_limits<int32_t>::max());
                 if (v > slot[ch]) slot[ch] = v;
             }
         }
@@ -259,7 +286,7 @@ struct audio_mixer::impl
             // Ruteo por canal (MIXER ... AUDIO): se pre-calcula el buffer ruteado de la layer y el bucle de
             // volumen lo consume en lugar de las muestras crudas. Sin ruteo (ni actual ni en el frame
             // anterior) no se entra aquí y el camino es el original.
-            std::vector<double> routed;
+            bool has_routed = false;
             {
                 auto prev_matrix_it = previous_matrices_.find(item.tag);
                 if (item.transform.routed || prev_matrix_it != previous_matrices_.end()) {
@@ -273,33 +300,55 @@ struct audio_mixer::impl
                     }
 
                     if (!muted) {
-                        routed = route_samples(fetch_sample, dst_size, ramp ? previous : current, current);
+                        route_samples(fetch_sample, dst_size, ramp ? previous : current, current, routed_);
+                        has_routed = true;
                     }
                 }
             }
 
             // Sample collection and volume application loop
-            for (auto n = 0; !muted && n < dst_size; ++n) {
-                double sample_value = routed.empty() ? fetch_sample(n) : routed[n];
+            // Rampa de volumen: se decide una vez por layer (antes se evaluaba en cada muestra).
+            const double volume        = item.transform.volume;
+            const bool   ramp_volume   = !item.transform.immediate_volume && std::abs(volume - previous_volume) > 0.001;
+            const size_t total_samples = dst_size / channels_;
 
-                double applied_volume = item.transform.volume;
-
-                // Apply sample-level volume ramping if not immediate volume and there's a volume change
-                if (!item.transform.immediate_volume && std::abs(item.transform.volume - previous_volume) > 0.001) {
-                    size_t sample_index  = n / channels_;
-                    size_t total_samples = dst_size / channels_;
-
-                    // Calculate linear interpolation position (0.0 to 1.0)
-                    double position = total_samples > 1
-                                          ? static_cast<double>(sample_index) / static_cast<double>(total_samples - 1)
-                                          : 1.0;
-                    position        = std::min(1.0, std::max(0.0, position)); // Clamp between 0 and 1
-
-                    // Linear interpolation between previous and current volume
-                    applied_volume = previous_volume + (item.transform.volume - previous_volume) * position;
+            auto volume_at = [&](size_t n) -> double {
+                if (!ramp_volume) {
+                    return volume;
                 }
+                size_t sample_index = n / channels_;
 
-                mixed[n] += sample_value * applied_volume;
+                // Calculate linear interpolation position (0.0 to 1.0)
+                double position = total_samples > 1
+                                      ? static_cast<double>(sample_index) / static_cast<double>(total_samples - 1)
+                                      : 1.0;
+                position        = std::min(1.0, std::max(0.0, position)); // Clamp between 0 and 1
+
+                // Linear interpolation between previous and current volume
+                return previous_volume + (volume - previous_volume) * position;
+            };
+
+            // Ruta rápida (sin ruteo, sin muestras pendientes de cadencia y con el frame completo):
+            // fetch_sample(n) es ptr[n], y se saltan los canales cuyo pico en este frame es 0 — todas sus
+            // muestras son 0 y sumarlas no cambia nada. El canal lleva 16 canales de audio pero una
+            // señal típica trae 2-6: el resto se mezclaba entero a cero en cada frame.
+            const bool direct = !muted && !has_routed && last_size == 0 && item_size >= dst_size;
+            if (direct) {
+                const auto peaks_it = per_tag_peaks_.find(item.tag);
+                for (int ch = 0; ch < channels_; ++ch) {
+                    if (peaks_it != per_tag_peaks_.end() && ch < static_cast<int>(peaks_it->second.size()) &&
+                        peaks_it->second[ch] == 0.0f) {
+                        continue;
+                    }
+                    for (size_t n = ch; n < dst_size; n += channels_) {
+                        mixed_[n] += static_cast<double>(ptr[n]) * volume_at(n);
+                    }
+                }
+            }
+
+            for (size_t n = 0; !muted && !direct && n < dst_size; ++n) {
+                double sample_value = has_routed ? routed_[n] : fetch_sample(n);
+                mixed_[n] += sample_value * volume_at(n);
             }
 
             if (has_variable_cadence_ && item.tag) {
@@ -335,8 +384,8 @@ struct audio_mixer::impl
         audio_streams_    = std::move(next_audio_streams);
 
         auto master_volume = master_volume_.load();
-        for (auto n = 0; n < mixed.size(); ++n) {
-            auto sample = mixed[n] * master_volume;
+        for (size_t n = 0; n < mixed_.size(); ++n) {
+            auto sample = mixed_[n] * master_volume;
             if (sample > std::numeric_limits<int32_t>::max()) {
                 result[n] = std::numeric_limits<int32_t>::max();
             } else if (sample < std::numeric_limits<int32_t>::min()) {
