@@ -405,6 +405,8 @@ struct ffmpeg_consumer : public core::frame_consumer
     std::exception_ptr exception_;
     std::mutex         exception_mutex_;
 
+    std::int64_t dropped_frames_ = 0; // solo se toca desde send() (hilo del canal)
+
     tbb::concurrent_bounded_queue<std::tuple<core::const_frame, std::int64_t, std::int64_t> > frame_buffer_;
     std::thread                                      frame_thread_;
 
@@ -424,7 +426,11 @@ struct ffmpeg_consumer : public core::frame_consumer
     {
         state_["file/path"] = u8(path_);
 
-        frame_buffer_.set_capacity(realtime_ ? 1 : 64);
+        // STREAM (realtime): 3 frames en vez de 1. Con 1, cualquier frame que llegaba mientras el
+        // anterior aún se codificaba (un pico puntual del encoder) se descartaba, dejando un hueco
+        // de 40 ms de vídeo y audio en la salida. 3 absorbe esos picos a costa de hasta 2 frames
+        // de latencia solo mientras dura el retraso.
+        frame_buffer_.set_capacity(realtime_ ? 3 : 64);
 
         diagnostics::register_graph(graph_);
         graph_->set_color("frame-time", diagnostics::color(0.1f, 1.0f, 0.1f));
@@ -640,6 +646,18 @@ struct ffmpeg_consumer : public core::frame_consumer
 
         if (!frame_buffer_.try_push({ frame, video_pts, audio_pts })) {
             graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+
+            // Antes el descarte solo quedaba en el grafo de diagnóstico: invisible en el log y en
+            // INFO/OSC. Ahora se cuenta en el estado (file/dropped-frames) y se registra el primero y
+            // luego uno de cada 250, para no inundar el log si el encoder no da abasto.
+            const auto dropped = ++dropped_frames_;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                state_["file/dropped-frames"] = dropped;
+            }
+            if (dropped == 1 || dropped % 250 == 0) {
+                CASPAR_LOG(warning) << print() << L" frames descartados por encoder lento: " << dropped;
+            }
         }
 
         video_pts += 1;
