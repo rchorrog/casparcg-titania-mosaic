@@ -35,8 +35,10 @@
 #include <core/frame/pixel_format.h>
 #include <core/video_format.h>
 
+#include <algorithm>
 #include <cmath>
 #include <queue>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -95,28 +97,39 @@ struct mixer::impl
 
         // Estado nuevo en cada frame: una layer que deja de tener audio (STOP, CLEAR, fuente sin audio) deja de
         // publicar su peak en vez de repetir el último valor medido.
-        state_          = monitor::state{};
-        state_["audio"] = audio_mixer_.state();
-
+        //
         // ── Per-layer audio peak → OSC /channel/N/mixer/layer/L/audio/peak/CH ──
+        // Se reúnen todas las claves y se construye el flat_map de una vez, ordenado: insertarlas una a una
+        // (layers en orden de puntero, canales 0,1,..,10 en orden numérico) desplazaba la tabla en cada
+        // inserción. Los canales 0-7 (los que pinta el vúmetro) se publican siempre; los 8-15 solo si traen
+        // señal — siempre a -100 eran la mitad de los mensajes OSC del canal. Sin peak_mono: osc-bridge.js lo
+        // descarta y ninguna plantilla lo usa.
         {
+            constexpr size_t osc_peak_channels_always = 8;
+
+            std::vector<std::pair<std::string, monitor::vector_t>> entries;
+            for (const auto& p : audio_mixer_.state()) {
+                entries.emplace_back("audio/" + p.first, p.second);
+            }
+
             const auto& tag_peaks = audio_mixer_.per_tag_peaks();
             for (const auto& kv : tag_to_layer) {
                 auto it = tag_peaks.find(kv.first);
                 if (it == tag_peaks.end()) continue;
-                const auto& ch_peaks = it->second;
+                const auto&       ch_peaks = it->second;
+                const std::string prefix   = "layer/" + std::to_string(kv.second) + "/audio/peak/";
                 // Emitir peak individual por canal de audio (0=L, 1=R, ...)
                 for (size_t ch = 0; ch < ch_peaks.size(); ++ch) {
                     float linear = ch_peaks[ch];
-                    float db     = linear > 1e-6f ? 20.0f * std::log10(linear) : -100.0f;
-                    state_["layer"][kv.second]["audio"]["peak"][static_cast<int>(ch)] = db;
+                    if (ch >= osc_peak_channels_always && linear <= 1e-6f) continue;
+                    float db = linear > 1e-6f ? 20.0f * std::log10(linear) : -100.0f;
+                    entries.emplace_back(prefix + std::to_string(ch), monitor::vector_t{monitor::data_t(db)});
                 }
-                // Compatibilidad: emitir también el peak mono (máximo de todos los canales)
-                float peak_max = 0.0f;
-                for (float v : ch_peaks) if (v > peak_max) peak_max = v;
-                float db_max = peak_max > 1e-6f ? 20.0f * std::log10(peak_max) : -100.0f;
-                state_["layer"][kv.second]["audio"]["peak_mono"] = db_max;
             }
+
+            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            // Rango ya ordenado: el constructor de flat_map lo inserta en tiempo lineal (y descarta duplicados).
+            state_ = monitor::state(monitor::data_map_t(entries.begin(), entries.end()));
         }
         // ─────────────────────────────────────────────────────────────────────
 

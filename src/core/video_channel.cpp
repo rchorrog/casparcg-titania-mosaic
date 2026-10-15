@@ -175,14 +175,17 @@ struct video_channel::impl final
 
                     graph_->set_value("frame-time", frame_timer.elapsed() * stage_frames.format_desc.hz * 0.5);
 
+                    // Claves en orden alfabético (format < framerate < mixer < output < stage): el estado
+                    // es un flat_map ordenado, e insertar "mixer/..." (~300 claves) por delante de las
+                    // ~500 de "stage/..." desplazaba todo el bloque en cada inserción, en cada frame.
                     monitor::state state = {};
-                    state["stage"]       = stage_->state();
-                    state["mixer"]       = mixer_.state();
-                    state["output"]      = output_.state();
+                    state["format"]      = stage_frames.format_desc.name;
                     state["framerate"]   = {stage_frames.format_desc.framerate.numerator() *
                                                 stage_frames.format_desc.field_count,
                                             stage_frames.format_desc.framerate.denominator()};
-                    state["format"]      = stage_frames.format_desc.name;
+                    state["mixer"]       = mixer_.state();
+                    state["output"]      = output_.state();
+                    state["stage"]       = stage_->state();
                     state_               = state;
 
                     caspar::timer osc_timer;

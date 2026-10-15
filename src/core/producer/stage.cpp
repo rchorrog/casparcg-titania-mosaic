@@ -36,9 +36,11 @@
 
 #include <boost/range/adaptors.hpp>
 
+#include <algorithm>
 #include <functional>
 #include <future>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace caspar { namespace core {
@@ -217,9 +219,19 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                     routesCb(-1, chan_lf);
                 }
 
-                monitor::state state;
+                // Capas en orden de su clave de texto ("layer/1", "layer/10".."layer/16", "layer/2"...),
+                // que es el orden del flat_map del estado: recorrerlas en orden numérico metía las
+                // capas 10-16 por delante de las 2-9 ya insertadas, desplazándolas en cada frame.
+                std::vector<std::pair<std::string, int>> ordered_layers;
+                ordered_layers.reserve(layers_.size());
                 for (auto& p : layers_) {
-                    state["layer"][p.first] = p.second.state();
+                    ordered_layers.emplace_back(std::to_string(p.first), p.first);
+                }
+                std::sort(ordered_layers.begin(), ordered_layers.end());
+
+                monitor::state state;
+                for (auto& l : ordered_layers) {
+                    state["layer"][l.second] = layers_.at(l.second).state();
                 }
                 state_ = std::move(state);
             } catch (...) {
