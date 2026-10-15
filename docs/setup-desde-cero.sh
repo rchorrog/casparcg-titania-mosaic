@@ -731,7 +731,7 @@ fase3_sistema() {
     ok "Usuario noc añadido al grupo docker (no necesita elevar permisos para Docker)."
   fi
 
-  # 3.8 Demonio SNMP (comunidad de lectura public-titania)
+  # 3.8 Demonio SNMP (comunidad de lectura public-titania, accesible desde toda la red)
   hdr "3.8 — Demonio SNMP"
   if ! command -v snmpd &>/dev/null; then
     info "Instalando snmpd..."
@@ -739,18 +739,45 @@ fase3_sistema() {
   fi
 
   local SNMPD_CONF="/etc/snmp/snmpd.conf"
+  local SNMPD_CHANGED=0
+  sudo cp -n "$SNMPD_CONF" "${SNMPD_CONF}.orig.bak" 2>/dev/null || true
+
+  if sudo grep -qE '^\s*agentAddress\s+udp:161,udp6:\[::1\]:161\s*$' "$SNMPD_CONF" 2>/dev/null; then
+    ok "agentAddress ya escucha en todas las interfaces (udp:161)."
+  else
+    sudo sed -i -E 's/^\s*#?\s*agentaddress\s+.*/agentAddress udp:161,udp6:[::1]:161/I' "$SNMPD_CONF"
+    ok "agentAddress ajustado para escuchar en todas las interfaces (udp:161)."
+    SNMPD_CHANGED=1
+  fi
+
+  if sudo grep -qE '^\s*view\s+all\s+included\s+\.1\s*$' "$SNMPD_CONF" 2>/dev/null; then
+    ok "Vista 'all' (árbol OID completo) ya existe."
+  else
+    echo "view   all         included   .1" | sudo tee -a "$SNMPD_CONF" > /dev/null
+    ok "Vista 'all' añadida."
+    SNMPD_CHANGED=1
+  fi
+
   if sudo grep -qE '^\s*rocommunity\s+public-titania\b' "$SNMPD_CONF" 2>/dev/null; then
     ok "snmpd ya tiene la comunidad de lectura public-titania."
   else
-    sudo cp -n "$SNMPD_CONF" "${SNMPD_CONF}.orig.bak" 2>/dev/null || true
-    echo "rocommunity public-titania" | sudo tee -a "$SNMPD_CONF" > /dev/null
-    sudo systemctl enable snmpd
-    sudo systemctl restart snmpd
-    ok "snmpd configurado con comunidad de lectura public-titania."
+    echo "rocommunity public-titania default -V all" | sudo tee -a "$SNMPD_CONF" > /dev/null
+    ok "snmpd configurado con comunidad de lectura public-titania (vista completa)."
+    SNMPD_CHANGED=1
   fi
-  warn "El snmpd.conf de Ubuntu por defecto solo escucha en 127.0.0.1 ('agentAddress')."
-  warn "Si el resto de instancias escucha en todas las interfaces, ajusta esa línea a mano en"
-  warn "${SNMPD_CONF} — no se toca aquí por no asumir la política de red del resto de nodos."
+
+  if sudo grep -qE '^\s*dontLogTCPWrappersConnects\s+yes\s*$' "$SNMPD_CONF" 2>/dev/null; then
+    ok "dontLogTCPWrappersConnects ya activado."
+  else
+    echo "dontLogTCPWrappersConnects yes" | sudo tee -a "$SNMPD_CONF" > /dev/null
+    ok "dontLogTCPWrappersConnects activado (evita saturar el log con las peticiones SNMP)."
+    SNMPD_CHANGED=1
+  fi
+
+  sudo systemctl enable snmpd
+  if [ "$SNMPD_CHANGED" -eq 1 ]; then
+    sudo systemctl restart snmpd
+  fi
 
   # 3.9 Estructura de directorios
   hdr "3.9 — Estructura de directorios"
@@ -1166,6 +1193,7 @@ check_sistema() {
     chk "usuario noc en grupo docker"              bash -c 'groups noc | grep -q docker'
   fi
   chk "snmpd activo con comunidad public-titania"  bash -c 'systemctl is-active --quiet snmpd && sudo grep -q "rocommunity public-titania" /etc/snmp/snmpd.conf'
+  chk "snmpd escucha en todas las interfaces (agentAddress)" bash -c 'sudo grep -qE "^\s*agentAddress\s+udp:161" /etc/snmp/snmpd.conf'
   chk "Node.js v20 instalado"                      bash -c 'node --version | grep -q "^v20"'
   chk "netcat-openbsd instalado"                   command -v nc
   chk "patchelf instalado"                         command -v patchelf
