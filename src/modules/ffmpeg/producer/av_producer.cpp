@@ -484,6 +484,8 @@ struct Filter
             if (!graph2) {
                 FF_RET(AVERROR(ENOMEM), "avfilter_graph_alloc");
             }
+            // Ver la nota de nb_threads en el grafo real, más abajo.
+            graph2->nb_threads = 1;
 
             CASPAR_SCOPE_EXIT
             {
@@ -559,6 +561,14 @@ struct Filter
         if (!graph) {
             FF_RET(AVERROR(ENOMEM), "avfilter_graph_alloc");
         }
+
+        // nb_threads = 1 ANTES de crear el primer filtro (parse2): con el valor por defecto (0)
+        // libavfilter abre un pool de hilos de slice de ~av_cpu_count() hilos por grafo, y aquí hay
+        // dos grafos por capa (vídeo y audio) más el grafo de sondeo de arriba en cada reset().
+        // Ninguno de estos filtros (null, fps, amerge, aresample, asetnsamples) usa threading por
+        // slice: eran ~16 hilos ociosos por capa en un host de 8 CPUs (~256 en un 4x4, ~1500 en uno
+        // de 48), creados y destruidos además en cada PLAY/discontinuidad.
+        graph->nb_threads = 1;
 
         FF(avfilter_graph_parse2(graph.get(), filter_spec.c_str(), &inputs, &outputs));
 
