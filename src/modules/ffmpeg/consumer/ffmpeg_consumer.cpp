@@ -73,6 +73,7 @@ extern "C" {
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
 
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -463,7 +464,11 @@ struct ffmpeg_consumer : public core::frame_consumer
             try {
                 std::map<std::string, std::string> options;
                 {
-                    static boost::regex opt_exp("-(?<NAME>[^\\s]+)(\\s+(?<VALUE>[^\\s]+))?");
+                    // El valor de una opción no puede ser otra opción ("-letra..."): sin esa condición
+                    // un flag sin valor como "-an" se quedaba con la opción siguiente como valor
+                    // ("-an -filter:a pan=..." perdía el filtro). Los números negativos ("-1") siguen
+                    // valiendo como valor.
+                    static boost::regex opt_exp("-(?<NAME>[^\\s]+)(\\s+(?<VALUE>(?!-[A-Za-z])[^\\s]+))?");
                     for (auto it = boost::sregex_iterator(args_.begin(), args_.end(), opt_exp);
                          it != boost::sregex_iterator();
                          ++it) {
@@ -519,8 +524,19 @@ struct ffmpeg_consumer : public core::frame_consumer
                     }
                 }
 
+                // "-an": sin stream de audio. Antes no existía: el stream se creaba siempre que el
+                // formato tuviera códec de audio por defecto (mp2 en mpegts), y con "-an" el ADD STREAM
+                // fallaba. Para no mandar audio había que codificarlo igualmente (pan=stereo) y tirarlo
+                // aguas abajo. Las opciones ":a" que queden se descartan para no avisar como no usadas.
+                const bool no_audio = options.erase("an") > 0;
+                if (no_audio) {
+                    for (auto it = options.begin(); it != options.end();) {
+                        it = boost::algorithm::ends_with(it->first, ":a") ? options.erase(it) : std::next(it);
+                    }
+                }
+
                 std::optional<Stream> audio_stream;
-                if (oc->oformat->audio_codec != AV_CODEC_ID_NONE) {
+                if (!no_audio && oc->oformat->audio_codec != AV_CODEC_ID_NONE) {
                     audio_stream.emplace(oc, ":a", oc->oformat->audio_codec, format_desc, realtime_, depth_, options);
                 }
 
