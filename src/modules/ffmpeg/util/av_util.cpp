@@ -20,6 +20,7 @@ extern "C" {
 #endif
 
 #include <array>
+#include <cstdint>
 
 #include <tuple>
 
@@ -350,14 +351,45 @@ std::shared_ptr<AVFrame> make_av_video_frame(const core::const_frame& frame, con
             break;
     }
 
-    FF(av_frame_get_buffer(av_frame.get(), is_16bit ? 64 : 32));
+    // Sin copia cuando se puede: el AVFrame apunta directamente a la memoria del const_frame del canal
+    // (la que ya leyó el mixer de la GPU) y cada plano guarda una copia del const_frame como dueño, que se
+    // libera cuando FFmpeg suelta el buffer. Antes se copiaba el frame entero (8,3 MB en 1080p BGRA) por cada
+    // consumer y frame, para que después el encoder lo volviera a copiar. Los buffers se marcan de solo
+    // lectura: un filtro que necesite escribir hace su propia copia (av_frame_make_writable). Solo si la
+    // memoria cumple la alineación que pediría av_frame_get_buffer; si no, se copia como antes.
+    const int alignment = is_16bit ? 64 : 32;
+    bool      zero_copy = !planes.empty();
+    for (int n = 0; zero_copy && n < static_cast<int>(planes.size()); ++n) {
+        const auto ptr = reinterpret_cast<std::uintptr_t>(frame.image_data(n).data());
+        zero_copy      = ptr % alignment == 0 && planes[n].linesize % alignment == 0 &&
+                    frame.image_data(n).size() >= static_cast<std::size_t>(planes[n].linesize) * planes[n].height;
+    }
 
-    // TODO (perf) Avoid extra memcpy.
-    for (int n = 0; n < planes.size(); ++n) {
-        for (int y = 0; y < av_frame->height; ++y) {
-            std::memcpy(av_frame->data[n] + y * av_frame->linesize[n],
-                        frame.image_data(n).data() + y * planes[n].linesize,
-                        planes[n].linesize);
+    if (zero_copy) {
+        for (int n = 0; n < static_cast<int>(planes.size()); ++n) {
+            auto owner = new core::const_frame(frame);
+            av_frame->buf[n] =
+                av_buffer_create(const_cast<std::uint8_t*>(frame.image_data(n).data()),
+                                 planes[n].linesize * planes[n].height,
+                                 [](void* opaque, std::uint8_t*) { delete static_cast<core::const_frame*>(opaque); },
+                                 owner,
+                                 AV_BUFFER_FLAG_READONLY);
+            if (!av_frame->buf[n]) {
+                delete owner;
+                FF_RET(AVERROR(ENOMEM), "av_buffer_create");
+            }
+            av_frame->data[n]     = av_frame->buf[n]->data;
+            av_frame->linesize[n] = planes[n].linesize;
+        }
+    } else {
+        FF(av_frame_get_buffer(av_frame.get(), alignment));
+
+        for (int n = 0; n < planes.size(); ++n) {
+            for (int y = 0; y < av_frame->height; ++y) {
+                std::memcpy(av_frame->data[n] + y * av_frame->linesize[n],
+                            frame.image_data(n).data() + y * planes[n].linesize,
+                            planes[n].linesize);
+            }
         }
     }
 
