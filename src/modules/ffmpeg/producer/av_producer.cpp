@@ -815,9 +815,6 @@ struct AVProducer::Impl
     std::atomic<bool>         buffer_eof_{false};
     int                       buffer_capacity_ = static_cast<int>(format_desc_.fps) / 4;
 
-    std::optional<caspar::executor> video_executor_;
-    std::optional<caspar::executor> audio_executor_;
-
     int latency_ = 0;
 
     // ── Rate governor ──────────────────────────────────────────────────────────────────
@@ -882,8 +879,6 @@ struct AVProducer::Impl
         , vfilter_(vfilter)
         , seekable_(seekable)
         , scale_mode_(scale_mode)
-        , video_executor_(L"video-executor")
-        , audio_executor_(L"audio-executor")
     {
         diagnostics::register_graph(graph_);
         graph_->set_color("underflow", diagnostics::color(0.6f, 0.3f, 0.9f));
@@ -947,9 +942,6 @@ struct AVProducer::Impl
         } catch (boost::thread_interrupted&) {
             // Do nothing...
         }
-
-        video_executor_.reset();
-        audio_executor_.reset();
 
         CASPAR_LOG(debug) << print() << " Joined";
     }
@@ -1105,18 +1097,17 @@ struct AVProducer::Impl
             {
                 progress |= schedule();
 
-                std::vector<std::future<bool>> futures;
-
+                // Filtros en el propio hilo del producer. Antes cada pasada del bucle (cada ~5 ms con
+                // fuentes en directo) mandaba el filtro de vídeo y el de audio a dos executors propios
+                // de la capa y esperaba sus futures: dos idas y vueltas entre hilos por iteración y dos
+                // hilos más por capa (32 en un 4x4), para filtros que aquí cuestan microsegundos (null +
+                // fps sobre tiles ya escalados; aresample).
                 if (!video_filter_.frame) {
-                    futures.push_back(video_executor_->begin_invoke([&]() { return video_filter_(); }));
+                    progress |= video_filter_();
                 }
 
                 if (!audio_filter_.frame) {
-                    futures.push_back(audio_executor_->begin_invoke([&]() { return audio_filter_(audio_cadence[0]); }));
-                }
-
-                for (auto& future : futures) {
-                    progress |= future.get();
+                    progress |= audio_filter_(audio_cadence[0]);
                 }
             }
 
