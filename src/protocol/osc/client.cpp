@@ -34,7 +34,9 @@
 #include <boost/asio.hpp>
 
 #include <condition_variable>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -72,8 +74,10 @@ struct client::impl : public spl::enable_shared_from_this<client::impl>
 
     std::mutex              mutex_;
     std::condition_variable cond_;
-    core::monitor::state    bundle_;
-    uint64_t                bundle_time_ = 0;
+    // Un hueco pendiente por canal ("/channel/N"), no uno solo para todos: con varios canales
+    // tickeando, el estado de un canal sobrescribía el de otro antes de enviarse y ese frame de OSC
+    // se perdía. Cada canal conserva solo su último estado, así que sigue acotado.
+    std::map<std::string, std::pair<core::monitor::state, uint64_t>> pending_;
 
     uint64_t time_ = 0;
 
@@ -89,21 +93,18 @@ struct client::impl : public spl::enable_shared_from_this<client::impl>
         thread_ = std::thread([=] {
             try {
                 while (!abort_request_) {
-                    core::monitor::state       bundle;
-                    uint64_t                   bundle_time;
-                    std::vector<udp::endpoint> endpoints;
+                    std::map<std::string, std::pair<core::monitor::state, uint64_t>> pending;
+                    std::vector<udp::endpoint>                                         endpoints;
 
                     {
                         std::unique_lock<std::mutex> lock(mutex_);
-                        cond_.wait(lock, [&] { return bundle_time_ > 0 || abort_request_; });
+                        cond_.wait(lock, [&] { return !pending_.empty() || abort_request_; });
 
                         if (abort_request_) {
                             return;
                         }
 
-                        bundle       = std::move(bundle_);
-                        bundle_time  = bundle_time_;
-                        bundle_time_ = 0;
+                        pending.swap(pending_);
 
                         for (auto& p : reference_counts_by_endpoint_) {
                             endpoints.push_back(p.first);
@@ -114,40 +115,63 @@ struct client::impl : public spl::enable_shared_from_this<client::impl>
                         continue;
                     }
 
-                    auto it = std::begin(bundle);
-
-                    while (it != std::end(bundle)) {
-                        ::osc::OutboundPacketStream o(reinterpret_cast<char*>(buffer_.data()),
-                                                      static_cast<unsigned long>(buffer_.size()));
-
-                        o << ::osc::BeginBundle(bundle_time);
-
-                        // TODO (fix): < 2048 is a hack. Properly calculate if messages will fit.
-                        while (it != std::end(bundle) && o.Size() < 2048) {
-                            o << ::osc::BeginMessage(it->first.c_str());
-
-                            param_visitor<decltype(o)> param_visitor(o);
-                            for (const auto& element : it->second) {
-                                boost::apply_visitor(param_visitor, element);
-                            }
-
-                            o << ::osc::EndMessage;
-
-                            ++it;
-                        }
-
-                        o << ::osc::EndBundle;
-
-                        boost::system::error_code ec;
-                        for (const auto& endpoint : endpoints) {
-                            socket_.send_to(boost::asio::buffer(o.Data(), o.Size()), endpoint, 0, ec);
-                        }
+                    for (auto& entry : pending) {
+                        send_bundle(entry.second.first, entry.second.second, endpoints);
                     }
                 }
             } catch (...) {
                 CASPAR_LOG_CURRENT_EXCEPTION();
             }
         });
+    }
+
+    void send_bundle(const core::monitor::state&       bundle,
+                     uint64_t                          bundle_time,
+                     const std::vector<udp::endpoint>& endpoints)
+    {
+        auto it = std::begin(bundle);
+
+        while (it != std::end(bundle)) {
+            ::osc::OutboundPacketStream o(reinterpret_cast<char*>(buffer_.data()),
+                                          static_cast<unsigned long>(buffer_.size()));
+
+            o << ::osc::BeginBundle(bundle_time);
+
+            // TODO (fix): < 2048 is a hack. Properly calculate if messages will fit.
+            while (it != std::end(bundle) && o.Size() < 2048) {
+                o << ::osc::BeginMessage(it->first.c_str());
+
+                param_visitor<decltype(o)> param_visitor(o);
+                for (const auto& element : it->second) {
+                    boost::apply_visitor(param_visitor, element);
+                }
+
+                o << ::osc::EndMessage;
+
+                ++it;
+            }
+
+            o << ::osc::EndBundle;
+
+            boost::system::error_code ec;
+            for (const auto& endpoint : endpoints) {
+                socket_.send_to(boost::asio::buffer(o.Data(), o.Size()), endpoint, 0, ec);
+            }
+        }
+    }
+
+    // "/channel/N" de la primera clave del estado: identifica de qué canal es (ver pending_).
+    static std::string channel_key(const core::monitor::state& state)
+    {
+        std::string key;
+        auto        it = std::begin(state);
+        if (it != std::end(state)) {
+            const auto& path   = it->first;
+            const auto  first  = path.find('/', 1);
+            const auto  second = first == std::string::npos ? std::string::npos : path.find('/', first + 1);
+            key                = path.substr(0, second);
+        }
+        return key;
     }
 
     ~impl()
@@ -190,8 +214,7 @@ struct client::impl : public spl::enable_shared_from_this<client::impl>
             std::lock_guard<std::mutex> lock(mutex_);
 
             // TODO: time_++ is a hack. Use proper channel time.
-            bundle_time_ = time_++;
-            bundle_      = state;
+            pending_[channel_key(state)] = {state, time_++};
         }
         cond_.notify_all();
     }
