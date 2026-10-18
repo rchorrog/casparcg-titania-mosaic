@@ -131,6 +131,9 @@ class route_producer
     fix_stream_tag                                               tag_fix_;
     core::video_format_desc                                      source_format_;
     bool                                                         is_cross_channel_ = false;
+    // AUDIO_RAW: descarta el audio_transform (MIXER VOLUME / AUDIO) de la capa origen, para que el
+    // canal destino aplique su propia mezcla sin heredar la del canal origen. La imagen no se toca.
+    bool                                                         audio_raw_;
 
     boost::signals2::scoped_connection connection_;
 
@@ -151,12 +154,18 @@ class route_producer
     }
 
   public:
-    route_producer(std::shared_ptr<route> route, video_format_desc format_desc, int buffer, int source_channel, int source_layer)
+    route_producer(std::shared_ptr<route> route,
+                   video_format_desc      format_desc,
+                   int                    buffer,
+                   int                    source_channel,
+                   int                    source_layer,
+                   bool                   audio_raw)
         : route_(route)
         , format_desc_(format_desc)
         , source_channel_(source_channel)
         , source_layer_(source_layer)
         , tag_fix_(this)
+        , audio_raw_(audio_raw && source_layer >= 0)
     {
         graph_ = spl::make_shared<diagnostics::graph>();
         buffer_.set_capacity(buffer > 0 ? buffer : 1);
@@ -183,6 +192,10 @@ class route_producer
                         frame1b = core::draw_frame::push(frame1);
                     }
 
+                    // En una ruta de capa, el transform de nivel superior es el MIXER de la capa origen
+                    if (self->audio_raw_)
+                        frame1b.transform().audio_transform = core::audio_transform{};
+
                     // Update the tag in the frame to allow the audio mixer to distinguish between the source frame and the routed frame
                     frame1b = self->tag_fix_(frame1b);
 
@@ -192,6 +205,8 @@ class route_producer
                         frame2b = frame1b;
                     } else {
                         // For interlaced formats, ensure field B gets the proper tag as well
+                        if (self->audio_raw_)
+                            frame2b.transform().audio_transform = core::audio_transform{};
                         frame2b = self->tag_fix_(frame2b);
                     }
 
@@ -260,7 +275,10 @@ class route_producer
 
     bool is_ready() override { return true; }
 
-    std::wstring print() const override { return L"route[" + route_->name + L"]"; }
+    std::wstring print() const override
+    {
+        return L"route[" + route_->name + (audio_raw_ ? L"|audio_raw" : L"") + L"]";
+    }
 
     std::wstring name() const override { return L"route"; }
 
@@ -307,8 +325,10 @@ spl::shared_ptr<core::frame_producer> create_route_producer(const core::frame_pr
         CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"No channel with id " + std::to_wstring(channel)));
     }
 
-    auto buffer = get_param(L"BUFFER", params, 0);
-    auto rp     = spl::make_shared<route_producer>((*channel_it)->route(layer, mode), dependencies.format_desc, buffer, channel, layer);
+    auto buffer    = get_param(L"BUFFER", params, 0);
+    auto audio_raw = contains_param(L"AUDIO_RAW", params);
+    auto rp        = spl::make_shared<route_producer>(
+        (*channel_it)->route(layer, mode), dependencies.format_desc, buffer, channel, layer, audio_raw);
     rp->connect_slot();
     return rp;
 }
