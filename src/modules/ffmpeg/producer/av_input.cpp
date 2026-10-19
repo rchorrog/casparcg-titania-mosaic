@@ -193,6 +193,42 @@ void Input::reset()
     internal_reset();
 }
 
+void Input::open()
+{
+    // ── The first open of a live input is retried too ───────────────────────────────────
+    // `run_read_loop` survives a live input that drops, but only after the first open has
+    // succeeded: until then it waits on `ic_cond_` for a context nobody will provide. A first
+    // open that failed threw out of the producer thread, and the layer stayed on "Waiting for
+    // video frame..." for the life of the producer. That is the normal case for a mosaic tile
+    // whose docker is not yet listening on its TCP port when the PLAY arrives (the SRT origin
+    // rejects the first call while it still holds the previous session, docker restarts the
+    // container, and the 4 s warm-up is gone): `Connection refused`, never retried, the docker
+    // then listens forever and stops reading SRT, and the tile freezes for good.
+    //
+    // Same backoff and latched log as the read loop. A file still fails at once, as before.
+    // Destroying the producer ends it: `abort()` makes the open return AVERROR_EXIT, which is
+    // rethrown, and the sleep is an interruption point for `thread_.interrupt()`.
+    int backoff_ms = 0;
+    for (int64_t attempt = 1;; ++attempt) {
+        try {
+            reset();
+            return;
+        } catch (...) {
+            if (!is_live() || abort_request_) {
+                throw;
+            }
+
+            backoff_ms = backoff_ms == 0 ? 100 : std::min(backoff_ms * 2, 5000);
+            if (attempt == 1 || attempt % 20 == 0) {
+                CASPAR_LOG(warning) << "av_input[" + filename_ + "] open failed; retrying (attempt " << attempt
+                                    << ", backoff " << backoff_ms << " ms)";
+            }
+
+            boost::this_thread::sleep_for(boost::chrono::milliseconds(backoff_ms));
+        }
+    }
+}
+
 void Input::internal_reset()
 {
     AVDictionary* options = nullptr;

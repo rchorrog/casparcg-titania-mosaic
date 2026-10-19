@@ -950,7 +950,7 @@ struct AVProducer::Impl
     {
         std::vector<int> audio_cadence = format_desc_.audio_cadence;
 
-        input_.reset();
+        input_.open();
         {
             core::monitor::state streams;
             for (auto n = 0UL; n < input_->nb_streams; ++n) {

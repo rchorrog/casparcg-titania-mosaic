@@ -36,6 +36,9 @@ class Input
     AVFormatContext* const operator->() const;
 
     void reset();
+    /// First open, from the producer thread. Like `reset`, but a live input that fails to open
+    /// is retried until it opens or the producer is destroyed. See `Input::open`.
+    void open();
     void abort();
     bool eof() const;
     void seek(int64_t ts, bool flush = true);
