@@ -95,6 +95,12 @@ void Input::run_read_loop()
                     break;
                 } else if (ret == AVERROR(EAGAIN)) {
                     boost::this_thread::yield();
+                } else if (ret == AVERROR_EOF && is_live()) {
+                    // A live input has no end: EOF is the sender closing the connection (the
+                    // mosaic's docker exiting and being restarted, e.g. its SRT timeout). As
+                    // `eof_` it left the producer sleeping on its last frame for good; as a
+                    // read failure it goes through the reopen path below, like any other drop.
+                    FF_RET(ret, "av_read_frame");
                 } else if (ret == AVERROR_EOF) {
                     eof_   = true;
                     packet = nullptr;
