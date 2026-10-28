@@ -73,6 +73,8 @@ extern "C" {
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
 
+#include <atomic>
+#include <chrono>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -410,6 +412,7 @@ struct ffmpeg_consumer : public core::frame_consumer
 
     tbb::concurrent_bounded_queue<std::tuple<core::const_frame, std::int64_t, std::int64_t> > frame_buffer_;
     std::thread                                      frame_thread_;
+    std::atomic<bool>                                frame_thread_done_{false};
 
     common::bit_depth depth_;
 
@@ -442,7 +445,13 @@ struct ffmpeg_consumer : public core::frame_consumer
     ~ffmpeg_consumer()
     {
         if (frame_thread_.joinable()) {
-            frame_buffer_.push({ core::const_frame{}, -1, -1 });
+            // Si el hilo de frames ya terminó (p. ej. no pudo abrir el destino) nadie vacía la cola:
+            // un push bloqueante con la cola llena dejaba este destructor colgado para siempre,
+            // con el encoder (sesión NVENC) sin liberar.
+            const std::tuple<core::const_frame, std::int64_t, std::int64_t> eof{ core::const_frame{}, -1, -1 };
+            while (!frame_thread_done_ && !frame_buffer_.try_push(eof)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             frame_thread_.join();
         }
     }
@@ -593,8 +602,26 @@ struct ffmpeg_consumer : public core::frame_consumer
 
                     } catch (...) {
                         CASPAR_LOG_CURRENT_EXCEPTION();
-                        // TODO
-                        packet_buffer.abort();
+                        // Error de escritura (p. ej. "Broken pipe" al reiniciarse el servidor RTMP).
+                        // Antes solo se abortaba la cola: el hilo de frames se quedaba bloqueado en
+                        // push() para siempre, send() nunca lanzaba y el consumer quedaba zombi
+                        // descartando todos los frames. Ahora el error llega a send(), que lo lanza
+                        // para que el canal retire el consumer, y se sigue vaciando la cola hasta el
+                        // centinela para que el hilo de frames pueda terminar.
+                        {
+                            std::lock_guard<std::mutex> lock(exception_mutex_);
+                            if (exception_ == nullptr) {
+                                exception_ = std::current_exception();
+                            }
+                        }
+                        try {
+                            std::shared_ptr<AVPacket> discarded;
+                            do {
+                                packet_buffer.pop(discarded);
+                            } while (discarded);
+                        } catch (...) {
+                            // abort() del cierre del hilo de frames: nada más que vaciar.
+                        }
                     }
                 });
                 CASPAR_SCOPE_EXIT
@@ -644,8 +671,11 @@ struct ffmpeg_consumer : public core::frame_consumer
                 packet_thread.join();
             } catch (...) {
                 std::lock_guard<std::mutex> lock(exception_mutex_);
-                exception_ = std::current_exception();
+                if (exception_ == nullptr) {
+                    exception_ = std::current_exception();
+                }
             }
+            frame_thread_done_ = true;
         });
     }
 
