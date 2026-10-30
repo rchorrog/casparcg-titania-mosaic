@@ -786,6 +786,16 @@ struct AVProducer::Impl
 
     std::map<int, std::vector<AVFilterContext*>> sources_;
 
+    /// Línea de tiempo de cada pista de audio a la entrada de `audio_filter_` (ver `align_audio`).
+    struct AudioTimeline
+    {
+        int64_t next   = AV_NOPTS_VALUE; // pts esperado de la siguiente muestra (time_base de la pista)
+        int64_t offset = 0;              // corrección acumulada que se suma a los pts de origen
+    };
+    std::map<int, AudioTimeline> audio_timelines_;
+    int64_t                      audio_seed_         = AV_NOPTS_VALUE; // start_time del último reset()
+    int64_t                      audio_realignments_ = 0;
+
     std::atomic<int64_t> start_{AV_NOPTS_VALUE};
     std::atomic<int64_t> duration_{AV_NOPTS_VALUE};
     std::atomic<int64_t> input_duration_{AV_NOPTS_VALUE};
@@ -1538,6 +1548,10 @@ struct AVProducer::Impl
                 continue;
             }
 
+            if (frame->data[0] && frame->nb_samples > 0) {
+                align_audio(p.first, *frame);
+            }
+
             for (auto& source : p.second) {
                 if (!frame->data[0]) {
                     FF(av_buffersrc_close(source, frame->pts, 0));
@@ -1579,8 +1593,53 @@ struct AVProducer::Impl
         reset(time);
     }
 
+    /// Tope a la compensación de `aresample` (async=1000, ver Filter). Sin él, un hueco entre el pts
+    /// de una muestra de audio y el que el filtro espera se rellena entero con silencio: con un
+    /// origen cuyo audio va desfasado de su vídeo (orígenes SRT de Brasil en sportynet-mosaic,
+    /// 29/10/2026: 449, 1847, 3672 y 4426 s, constantes durante horas) cada PLAY o reconexión de esa
+    /// capa inyectaba ~1398 s de silencio (≈2 GB, el tope de libswresample) antes de fallar con
+    /// "Failed to compensate for timestamp delta", y la capa quedaba muda mientras se vaciaba. Un
+    /// desfase fijo no es un salto dentro de la pista, así que la detección del Decoder no lo ve.
+    ///
+    /// Por pista: si el pts se aleja más de 2 s del esperado (al principio, el start_time del filtro;
+    /// después, el final de la muestra anterior), se absorbe la diferencia en un offset que se aplica
+    /// a esa y a las siguientes. Por debajo de 2 s no se toca nada: los micro-cortes los sigue tapando
+    /// aresample. La sincronía no depende de esto: cada frame de salida empareja vídeo y audio por
+    /// orden de llegada, no por pts.
+    void align_audio(int index, AVFrame& frame)
+    {
+        if (frame.pts == AV_NOPTS_VALUE || frame.sample_rate <= 0) {
+            return;
+        }
+
+        const auto tb       = input_->streams[index]->time_base;
+        auto&      timeline = audio_timelines_[index];
+        const auto expected = timeline.next != AV_NOPTS_VALUE ? timeline.next
+                              : audio_seed_ != AV_NOPTS_VALUE ? av_rescale_q(audio_seed_, TIME_BASE_Q, tb)
+                                                              : AV_NOPTS_VALUE;
+        const auto pts      = frame.pts + timeline.offset;
+
+        if (expected != AV_NOPTS_VALUE &&
+            std::abs(pts - expected) > av_rescale_q(2 * AV_TIME_BASE, TIME_BASE_Q, tb)) {
+            audio_realignments_ += 1;
+            if (audio_realignments_ == 1 || audio_realignments_ % 25 == 0) {
+                CASPAR_LOG(warning) << print() << " audio stream " << index << " off its timeline by "
+                                    << av_q2d(tb) * static_cast<double>(pts - expected)
+                                    << " s; realigning instead of padding (" << audio_realignments_ << " so far)";
+            }
+            timeline.offset += expected - pts;
+        }
+
+        frame.pts += timeline.offset;
+        timeline.next = frame.pts + av_rescale_q(frame.nb_samples, AVRational{1, frame.sample_rate}, tb);
+    }
+
     void reset(int64_t start_time)
     {
+        // Filtros nuevos sembrados en start_time: la línea de tiempo del audio vuelve a empezar ahí.
+        audio_seed_ = start_time;
+        audio_timelines_.clear();
+
         video_filter_ = Filter(vfilter_, input_, decoders_, start_time, AVMEDIA_TYPE_VIDEO, format_desc_);
         audio_filter_ = Filter(afilter_, input_, decoders_, start_time, AVMEDIA_TYPE_AUDIO, format_desc_);
 
