@@ -113,6 +113,14 @@ struct output::impl
         // If no frame is provided, this should only happen when the channel has no consumers.
         // Take a shortcut and perform the sleep to let the channel tick correctly.
         if (!input_frame1) {
+            // Sin consumers no se vuelve a construir el estado más abajo: vaciarlo para que
+            // INFO no siga mostrando los consumers recién eliminados (p. ej. tras un REMOVE).
+            {
+                std::lock_guard<std::mutex> lock(consumers_mutex_);
+                if (consumers_.empty()) {
+                    state_ = monitor::state{};
+                }
+            }
             if (!time) {
                 time = std::chrono::high_resolution_clock::now();
             } else {
