@@ -43,6 +43,9 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/regex.hpp>
 
+#include <set>
+#include <vector>
+
 #pragma warning(push)
 #pragma warning(disable : 4244)
 #pragma warning(disable : 4245)
@@ -102,9 +105,11 @@ struct Stream
            const core::video_format_desc&      format_desc,
            bool                                realtime,
            common::bit_depth                   depth,
-           std::map<std::string, std::string>& options)
+           std::map<std::string, std::string>& options,
+           std::set<std::string>&              used_unsuffixed)
     {
         std::map<std::string, std::string> stream_options;
+        std::set<std::string>              folded; // unsuffixed keys copied in; see the fold below
 
         {
             auto tmp = std::move(options);
@@ -138,6 +143,33 @@ struct Stream
 
         if (!codec) {
             FF_RET(AVERROR(EINVAL), "avcodec_find_encoder");
+        }
+
+        // AN UNSUFFIXED CODEC OPTION GOES TO EVERY ENCODER THAT HAS IT -- the ffmpeg CLI's rule
+        // (fftools/cmdutils.c, filter_codec_opts), ported from CasparVP. Only `:v`/`:a` keys used
+        // to reach a stream, so `-g 10`, `-tune zerolatency`, `-crf 25` -- the spelling of the 2.5
+        // CHANGELOG's own example -- fell through to the muxer and were logged as "Unused option".
+        // Measured with tools/test/live_input_test.py: `-g 10` gave keyframes every 12 frames
+        // (the default) instead of 10. COPIED, not moved, as the CLI does: the other stream sees it
+        // too; it leaves the muxer's options only once some encoder took it. A suffixed key wins.
+        {
+            static const std::set<std::string> interpreted_here = {"codec", "filter", "format", "an"};
+            const AVClass* generic = avcodec_get_class();
+            const AVClass* priv    = codec->priv_class;
+            const int      flags   = AV_OPT_FLAG_ENCODING_PARAM |
+                              (codec->type == AVMEDIA_TYPE_VIDEO ? AV_OPT_FLAG_VIDEO_PARAM : AV_OPT_FLAG_AUDIO_PARAM);
+            for (const auto& p : options) {
+                const auto& key = p.first;
+                if (p.second.empty() || key.find(':') != std::string::npos || interpreted_here.count(key) ||
+                    stream_options.count(key)) {
+                    continue;
+                }
+                if (av_opt_find(&generic, key.c_str(), nullptr, flags, AV_OPT_SEARCH_FAKE_OBJ) ||
+                    (priv && av_opt_find(&priv, key.c_str(), nullptr, flags, AV_OPT_SEARCH_FAKE_OBJ))) {
+                    stream_options.emplace(key, p.second);
+                    folded.insert(key);
+                }
+            }
         }
 
         AVFilterInOut* outputs = nullptr;
@@ -327,8 +359,17 @@ struct Stream
         auto dict = to_dict(std::move(stream_options));
         CASPAR_SCOPE_EXIT { av_dict_free(&dict); };
         FF(avcodec_open2(enc.get(), codec, &dict));
-        for (auto& p : to_map(&dict)) {
-            options[p.first] = p.second + suffix;
+        // What the encoder did not take goes back for the muxer, under its SUFFIXED key. This used
+        // to append the suffix to the VALUE (`g=10:v`), so the "Unused option" line misnamed it.
+        // A folded key is not handed back: its unsuffixed original is still in `options`.
+        auto leftovers = to_map(&dict);
+        for (const auto& key : folded) {
+            if (leftovers.erase(key) == 0) {
+                used_unsuffixed.insert(key);
+            }
+        }
+        for (auto& p : leftovers) {
+            options[p.first + suffix] = p.second;
         }
 
         FF(avcodec_parameters_from_context(st->codecpar, enc.get()));
@@ -484,6 +525,21 @@ struct ffmpeg_consumer : public core::frame_consumer
                         options[(*it)["NAME"].str().c_str()] =
                             (*it)["VALUE"].matched ? (*it)["VALUE"].str().c_str() : "";
                     }
+
+                    // The ffmpeg CLI's short spellings are aliases of the ones this consumer reads.
+                    // `-f mpegts` used to be ignored (measured: "Unable to choose an output format"
+                    // for udp://, so the output never opened) and `-vcodec`/`-c:v` never chose the
+                    // codec (measured: mpeg2video instead of libx264). A clash between two
+                    // spellings of one option is left alone: the explicit long form wins.
+                    for (const auto& alias : std::vector<std::pair<std::string, std::string>>{
+                             {"c:v", "codec:v"}, {"vcodec", "codec:v"}, {"c:a", "codec:a"}, {"acodec", "codec:a"},
+                             {"vf", "filter:v"}, {"af", "filter:a"}, {"f", "format"}}) {
+                        const auto it = options.find(alias.first);
+                        if (it != options.end() && options.count(alias.second) == 0) {
+                            options[alias.second] = std::move(it->second);
+                            options.erase(it);
+                        }
+                    }
                 }
 
                 boost::filesystem::path full_path = path_;
@@ -520,12 +576,17 @@ struct ffmpeg_consumer : public core::frame_consumer
 
                 CASPAR_SCOPE_EXIT { avformat_free_context(oc); };
 
+                std::set<std::string> used_unsuffixed; // filled by the Streams; see Stream::Stream
                 std::optional<Stream> video_stream;
                 if (oc->oformat->video_codec != AV_CODEC_ID_NONE) {
-                    if (oc->oformat->video_codec == AV_CODEC_ID_H264 && options.find("preset:v") == options.end()) {
+                    // The default preset is ours, and must not override the operator's: an
+                    // unsuffixed `-preset` reaches the encoder now, and a suffixed key would win.
+                    if (oc->oformat->video_codec == AV_CODEC_ID_H264 && options.find("preset:v") == options.end() &&
+                        options.find("preset") == options.end()) {
                         options["preset:v"] = "veryfast";
                     }
-                    video_stream.emplace(oc, ":v", oc->oformat->video_codec, format_desc, realtime_, depth_, options);
+                    video_stream.emplace(
+                        oc, ":v", oc->oformat->video_codec, format_desc, realtime_, depth_, options, used_unsuffixed);
 
                     {
                         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -546,7 +607,13 @@ struct ffmpeg_consumer : public core::frame_consumer
 
                 std::optional<Stream> audio_stream;
                 if (!no_audio && oc->oformat->audio_codec != AV_CODEC_ID_NONE) {
-                    audio_stream.emplace(oc, ":a", oc->oformat->audio_codec, format_desc, realtime_, depth_, options);
+                    audio_stream.emplace(
+                        oc, ":a", oc->oformat->audio_codec, format_desc, realtime_, depth_, options, used_unsuffixed);
+                }
+
+                // An unsuffixed option some encoder took is done; the muxer must not report it.
+                for (const auto& key : used_unsuffixed) {
+                    options.erase(key);
                 }
 
                 if (!(oc->oformat->flags & AVFMT_NOFILE)) {
