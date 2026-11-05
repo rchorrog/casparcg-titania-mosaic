@@ -41,8 +41,11 @@
 #include <core/diagnostics/call_context.h>
 #include <core/mixer/image/image_mixer.h>
 
+#include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -52,7 +55,18 @@ bool operator<(const route_id& a, const route_id& b) { return a.mode + (a.index 
 
 struct video_channel::impl final
 {
-    monitor::state state_;
+    /// The last tick's state, PUBLISHED as an immutable snapshot. state() used to copy a plain
+    /// member while the channel thread was assigning it -- a data race with every INFO and every
+    /// RELINK_SIGNAL, which read it from the AMCP thread. Now the tick swaps a pointer under a
+    /// lock held only for that, and readers copy the pointer, never the map being written.
+    mutable std::mutex                    state_mutex_;
+    std::shared_ptr<const monitor::state> state_ = std::make_shared<const monitor::state>();
+
+    std::shared_ptr<const monitor::state> published_state() const
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return state_;
+    }
 
     const channel_info channel_info_;
 
@@ -126,6 +140,7 @@ struct video_channel::impl final
             set_thread_name(L"channel-" + std::to_wstring(channel_info_.index));
 
             while (!abort_request_) {
+                caspar::timer tick_timer;
                 try {
                     graph_->set_text(print());
 
@@ -186,13 +201,30 @@ struct video_channel::impl final
                     state["mixer"]       = mixer_.state();
                     state["output"]      = output_.state();
                     state["stage"]       = stage_->state();
-                    state_               = state;
+                    auto snapshot        = std::make_shared<const monitor::state>(std::move(state));
+                    {
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        state_ = snapshot;
+                    }
 
                     caspar::timer osc_timer;
-                    tick_(state_);
+                    tick_(*snapshot);
                     graph_->set_value("osc-time", osc_timer.elapsed() * stage_frames.format_desc.hz * 0.5);
                 } catch (...) {
                     CASPAR_LOG_CURRENT_EXCEPTION();
+                    // Only the consumers pace this loop, and output_() is the LAST phase: a phase
+                    // that throws every tick (mixer, OSC) skipped it and the channel free-ran, one
+                    // core pegged and the log flooded (CasparVP measured ~4800 ticks/s). Sleep out
+                    // the rest of this frame period instead.
+                    try {
+                        const double period    = 1.0 / std::max(1.0, stage_->video_format_desc().hz);
+                        const double remaining = period - tick_timer.elapsed();
+                        if (remaining > 0) {
+                            std::this_thread::sleep_for(std::chrono::duration<double>(remaining));
+                        }
+                    } catch (...) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
                 }
             }
         });
@@ -261,7 +293,7 @@ output&                             video_channel::output() { return impl_->outp
 spl::shared_ptr<frame_factory>      video_channel::frame_factory() { return impl_->image_mixer_; }
 int                                 video_channel::index() const { return impl_->index(); }
 channel_info         video_channel::get_consumer_channel_info() const { return impl_->get_consumer_channel_info(); };
-core::monitor::state video_channel::state() const { return impl_->state_; }
+core::monitor::state video_channel::state() const { return *impl_->published_state(); }
 
 std::shared_ptr<route> video_channel::route(int index, route_mode mode) { return impl_->route(index, mode); }
 

@@ -51,6 +51,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     spl::shared_ptr<diagnostics::graph> graph_;
     monitor::state                      state_;
     std::map<int, layer>                layers_;
+    std::map<int, int64_t>              layer_failures_; //< consecutive failed ticks, per layer
     std::map<int, tweened_transform>    tweens_;
     std::set<int>                       routeSources;
 
@@ -168,37 +169,55 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                     if (p == layers_.end())
                         continue;
 
-                    auto& layer = p->second;
-                    auto& tween = tweens_[p->first];
+                    // ONE LAYER'S FAULT STAYS IN THAT LAYER (after CasparVP 8298f1534). A producer's
+                    // own receive() is already caught in layer::receive, which stops that layer;
+                    // what is not is the rest of this block -- the tween, the frame push, the route
+                    // callback -- and the handler below used to be the only one for it, doing
+                    // layers_.clear(): every layer of the channel, every tile of a mosaic. Now the
+                    // failing layer is black for that tick and the rest stay on air. It is not
+                    // removed: an operator would rather see the tile black and the log say why.
+                    try {
+                        auto& layer = p->second;
+                        auto& tween = tweens_[p->first];
 
-                    auto has_background_route =
-                        std::find(fetch_background.begin(), fetch_background.end(), p->first) != fetch_background.end();
+                        auto has_background_route =
+                            std::find(fetch_background.begin(), fetch_background.end(), p->first) != fetch_background.end();
 
-                    layer_frame res = {};
-                    if (l.second) {
-                        res.foreground1 = draw_frame::push(layer.receive(field1, result.nb_samples), tween.fetch());
-                        res.foreground1.transform().image_transform.enable_geometry_modifiers = true;
-                    }
-
-                    res.has_background = layer.has_background();
-                    if (has_background_route)
-                        res.background1 = layer.receive_background(field1, result.nb_samples);
-
-                    if (is_interlaced) {
-                        res.is_interlaced = true;
+                        layer_frame res = {};
                         if (l.second) {
-                            res.foreground2 =
-                                draw_frame::push(layer.receive(video_field::b, result.nb_samples), tween.fetch());
-                            res.foreground2.transform().image_transform.enable_geometry_modifiers = true;
+                            res.foreground1 = draw_frame::push(layer.receive(field1, result.nb_samples), tween.fetch());
+                            res.foreground1.transform().image_transform.enable_geometry_modifiers = true;
                         }
+
+                        res.has_background = layer.has_background();
                         if (has_background_route)
-                            res.background2 = layer.receive_background(video_field::b, result.nb_samples);
+                            res.background1 = layer.receive_background(field1, result.nb_samples);
+
+                        if (is_interlaced) {
+                            res.is_interlaced = true;
+                            if (l.second) {
+                                res.foreground2 =
+                                    draw_frame::push(layer.receive(video_field::b, result.nb_samples), tween.fetch());
+                                res.foreground2.transform().image_transform.enable_geometry_modifiers = true;
+                            }
+                            if (has_background_route)
+                                res.background2 = layer.receive_background(video_field::b, result.nb_samples);
+                        }
+
+                        frames[p->first] = res;
+
+                        // push received foreground frame to any configured route producer
+                        routesCb(p->first, res);
+                        layer_failures_.erase(p->first);
+                    } catch (...) {
+                        const auto n = ++layer_failures_[p->first];
+                        if (n == 1 || n % 250 == 0) {
+                            CASPAR_LOG(error) << L"[stage] layer " << p->first << L" failed to produce a frame ("
+                                              << n << L" ticks in a row); the other layers continue";
+                            CASPAR_LOG_CURRENT_EXCEPTION();
+                        }
+                        frames[p->first] = layer_frame{};
                     }
-
-                    frames[p->first] = res;
-
-                    // push received foreground frame to any configured route producer
-                    routesCb(p->first, res);
                 }
 
                 for (auto& p : frames) {
@@ -235,7 +254,8 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                 }
                 state_ = std::move(state);
             } catch (...) {
-                layers_.clear();
+                // Stage-wide bookkeeping (routes, tweens, state), not a producer: per-layer faults
+                // are caught above. Clearing layers_ here wiped the whole channel.
                 CASPAR_LOG_CURRENT_EXCEPTION();
             }
 
