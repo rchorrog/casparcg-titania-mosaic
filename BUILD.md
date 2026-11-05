@@ -141,6 +141,16 @@ de `https://github.com/mko1989/highascg/releases/download/v.142/...` en vez del 
    Nota aparte: el commit `d74e0a5` (`use-gl=disabled` en el gpu-process de CEF), que es la punta
    de la rama de la que parte esto, no figura en esta lista.
 
+4. **Módulo de replay de CasparVP** (rama `feature/prefader-metering-replay`) — `src/modules/replay`
+   (nuevo, `BUILD_REPLAY=ON` por defecto; descarga libvmx en el configure, fijado en `a1828cb4`),
+   más dos arreglos fuera del módulo que hacían falta para usarlo:
+   `src/protocol/amcp/AMCPCommandQueue.cpp` (un `CALL` cuyo producer rechaza el verbo no respondía
+   nada) y `src/modules/ffmpeg/producer/ffmpeg_producer.cpp` (en Linux, error con backtrace en el
+   log en cada `PLAY` de un nombre que es un directorio de media). Uso, diferencias con el fork y
+   prueba en [`docs/replay.md`](docs/replay.md); la prueba es `tools/test/replay_test.py`, con su
+   imagen Docker en `tools/test/Dockerfile`. **Construido y probado**: 28/28 en WSL2 Ubuntu 24.04,
+   en Windows y en Docker (2026-11-05).
+
 ## Receta de build (misma que `build-and-deploy.sh` / Fase 4C de `setup-desde-cero.sh`)
 
 ```bash
