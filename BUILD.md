@@ -142,7 +142,7 @@ de `https://github.com/mko1989/highascg/releases/download/v.142/...` en vez del 
    de la rama de la que parte esto, no figura en esta lista.
 
 4. **Módulo de replay de CasparVP** (rama `feature/prefader-metering-replay`) — `src/modules/replay`
-   (nuevo, `BUILD_REPLAY=ON` por defecto; descarga libvmx en el configure, fijado en `a1828cb4`),
+   (nuevo, `BUILD_REPLAY=ON` por defecto; libvmx va dentro del árbol, fijado en `a1828cb4`),
    más dos arreglos fuera del módulo que hacían falta para usarlo:
    `src/protocol/amcp/AMCPCommandQueue.cpp` (un `CALL` cuyo producer rechaza el verbo no respondía
    nada) y `src/modules/ffmpeg/producer/ffmpeg_producer.cpp` (en Linux, error con backtrace en el
@@ -150,6 +150,17 @@ de `https://github.com/mko1989/highascg/releases/download/v.142/...` en vez del 
    prueba en [`docs/replay.md`](docs/replay.md); la prueba es `tools/test/replay_test.py`, con su
    imagen Docker en `tools/test/Dockerfile`. **Construido y probado**: 28/28 en WSL2 Ubuntu 24.04,
    en Windows y en Docker (2026-11-05).
+
+5. **Entradas en directo, salidas STREAM, AMCP y núcleo** (misma rama, 2026-11-05) — cada arreglo
+   medido en rojo antes y en verde después con `tools/test/live_input_test.py` (22 comprobaciones,
+   WSL2 Ubuntu 24.04 y Windows): una entrada SRT/UDP sobrevive a paquetes corruptos, a una
+   reconexión con otro formato y a un cambio de formato sin reconexión (antes: vídeo, y a veces
+   audio, muertos hasta otro PLAY); las opciones de codificador sin sufijo y `-c:v`/`-vcodec`/`-f`
+   llegan a la salida STREAM; una línea AMCP con el CRLF partido entre lecturas ya no se ejecuta dos
+   veces; `mallinfo()` sustituido para el SIGILL de CEF de la entrada 2; estado del canal sin carrera;
+   y compatibilidad con FFmpeg 8 (por debajo de 8 el código es el de antes). Detalle en cada commit.
+   WebRTC: [`docs/webrtc.md`](docs/webrtc.md) — la ruta recomendada (SRT a MediaMTX) no necesita
+   cambios en CasparCG; FFmpeg 8 (WHIP nativo) **no** es apto todavía para las entradas.
 
 ## Receta de build (misma que `build-and-deploy.sh` / Fase 4C de `setup-desde-cero.sh`)
 
