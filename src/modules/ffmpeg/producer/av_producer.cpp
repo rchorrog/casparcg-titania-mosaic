@@ -171,6 +171,14 @@ class Decoder
     std::atomic<bool> broken         = {false};
     int64_t           failures_total = 0;
 
+    // The timeline filter in the decode loop (decode thread only): frames of a jump not yet
+    // confirmed, with their durations; where the next of them is expected; and latched counters.
+    std::vector<std::pair<std::shared_ptr<AVFrame>, int64_t>> held;
+    int64_t                                                   held_next        = AV_NOPTS_VALUE;
+    int64_t                                                   nopts_filled     = 0;
+    int64_t                                                   nopts_dropped    = 0;
+    int64_t                                                   outliers_dropped = 0;
+
     /// Set by the decode thread when the source's timeline jumps; consumed once by the
     /// producer thread, which rebuilds the filter graph. See the detection site below for why
     /// it cannot be done anywhere later.
@@ -277,6 +285,7 @@ class Decoder
                             FF(avcodec_send_packet(ctx.get(), packet.get()));
                         } else if (ret == AVERROR_EOF) {
                             avcodec_flush_buffers(ctx.get());
+                            held.clear(); // an unconfirmed jump at end of stream is not shown
                             av_frame->pts = next_pts;
                             next_pts      = AV_NOPTS_VALUE;
                             eof           = true;
@@ -305,42 +314,6 @@ class Decoder
                             // TODO (fix) is this always best?
                             av_frame->pts = av_frame->best_effort_timestamp;
 
-                            // ── Discontinuity detection, and it has to be HERE ──────────────
-                            // This is the last point where the timestamp is still the source's
-                            // own. Downstream, `vf_fps` replaces it with a counter
-                            // (`libavfilter/vf_fps.c:305`: `frame->pts = s->next_pts++`), so a
-                            // jump is undetectable from `Frame::pts` -- and worse, `vf_fps` never
-                            // re-seeds that counter, so after a jump it silently drops every
-                            // frame (backward) or duplicates one (forward) until the gap is made
-                            // up. A 33-bit MPEG-TS PTS wrap is ~26.5 h, so on a 24/7 wall that is
-                            // a tile frozen for a day, with a healthy-looking buffer and no
-                            // underflow tag anywhere.
-                            //
-                            // Threshold, not equality: normal jitter and B-frame reordering move
-                            // the timestamp around by a frame or two. Five seconds in stream time
-                            // is far past anything legitimate and far below a wrap.
-                            if (next_pts != AV_NOPTS_VALUE && av_frame->pts != AV_NOPTS_VALUE) {
-                                const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
-                                if (std::abs(av_frame->pts - next_pts) > threshold) {
-                                    discontinuity_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
-                                    discontinuity      = true;
-                                }
-                            }
-
-                            // Publish the SOURCE timestamp, for the same reason the check above sits
-                            // here: this is the last place it exists. Everything downstream -- and
-                            // that includes `file/time`, which is what an operator reads over OSC --
-                            // is derived from the filter graph's output, i.e. from `vf_fps`'s counter
-                            // rather than from the stream. The two agree while nothing is dropped and
-                            // diverge silently afterwards, which is exactly the failure worth
-                            // catching, and until now there was no way to see it happen.
-                            //
-                            // Rescaled to AV_TIME_BASE so it can be compared across streams whose
-                            // time bases differ; comparing raw ticks between two inputs is wrong.
-                            if (av_frame->pts != AV_NOPTS_VALUE) {
-                                source_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
-                            }
-
     #if LIBAVUTIL_VERSION_MAJOR < 58
                             auto duration_pts = av_frame->pkt_duration;
     #else
@@ -367,17 +340,97 @@ class Decoder
                                 }
                             }
 
-                            if (duration_pts > 0) {
-                                next_pts = av_frame->pts + duration_pts;
-                            } else {
-                                next_pts = AV_NOPTS_VALUE;
+                            // ── Discontinuity detection, and it has to be HERE ──────────────
+                            // This is the last point where the timestamp is still the source's own.
+                            // Downstream, vf_fps replaces it with a counter and never re-seeds it, so
+                            // after a jump it drops every frame (backward) or duplicates one
+                            // (forward) until the gap is made up: a tile frozen with a healthy buffer.
+                            // Five seconds in stream time is far past jitter and far below a wrap.
+                            // source_time is published from here for the same reason (accept()).
+                            //
+                            // ── ONLY A TRUSTED TIMELINE REACHES THE FILTER GRAPH (2026-11) ───────
+                            // Two kinds of frame, both routine after SRT/UDP corruption and both
+                            // emitted by FFmpeg 6.1's and 8.1.2's decoders, wedge the bwdif -> fps
+                            // chain. Reproduced outside CasparCG by feeding that exact chain (the
+                            // same with both FFmpeg versions):
+                            //  * a frame with NO timestamp -> the graph runs away: it emits frames
+                            //    forever with no input and never asks for another (100001+ per
+                            //    pull, failed requests 0). In the server: a frozen tile with live
+                            //    audio. It also poisoned next_pts (NOPTS + duration), so the next
+                            //    good frame always looked like a jump -- the storms of 25-49 resyncs
+                            //    per corrupt burst in every log.
+                            //  * a single far-off OUTLIER (one frame at 3831 s inside a stream at
+                            //    10 s) -> vf_fps pads the gap: 191073 copies of one picture; and as
+                            //    a resync seed, a start time far from the frames, after which
+                            //    nothing is ever output.
+                            // The freeze needed one of these to land in the LAST graph of a burst,
+                            // which FFmpeg 8's decoder made frequent (5 of 37 runs) and 6.1's rare.
+                            //
+                            // So: a frame more than five seconds off the expected timeline is HELD.
+                            // If the old timeline resumes, it was an outlier and is dropped. If three
+                            // frames in a row agree on the new one, the jump is real (encoder
+                            // restart, wrap) and is confirmed at its first frame. A frame with no
+                            // timestamp takes the expected one -- only from the trusted timeline,
+                            // never while a jump is unconfirmed, when it is dropped instead.
+                            const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
+                            const auto log_latched = [&](int64_t& counter, const char* what) {
+                                counter += 1;
+                                if (counter == 1 || counter % 100 == 0) {
+                                    CASPAR_LOG(warning) << "[ffmpeg] decoder (" << av_get_media_type_string(ctx->codec_type)
+                                                        << ") " << what << " (" << counter << " so far)";
+                                }
+                            };
+
+                            if (av_frame->pts == AV_NOPTS_VALUE) {
+                                if (!held.empty() || next_pts == AV_NOPTS_VALUE) {
+                                    log_latched(nopts_dropped, "dropped a frame with no timestamp");
+                                    continue;
+                                }
+                                log_latched(nopts_filled, "gave a frame with no timestamp the expected one");
+                                av_frame->pts = next_pts;
                             }
 
-                            {
+                            // Hand a frame on, as the old code did after the checks below, and
+                            // advance the trusted timeline to just after it.
+                            const auto accept = [&](std::shared_ptr<AVFrame> f, int64_t dur) {
+                                source_time = av_rescale_q(f->pts, st->time_base, TIME_BASE_Q);
+                                next_pts    = dur > 0 ? f->pts + dur : AV_NOPTS_VALUE;
                                 boost::unique_lock<boost::mutex> lock(output_mutex);
                                 output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
-                                output.push(std::move(av_frame));
+                                output.push(std::move(f));
+                            };
+
+                            if (next_pts == AV_NOPTS_VALUE || std::abs(av_frame->pts - next_pts) <= threshold) {
+                                if (!held.empty()) {
+                                    outliers_dropped += static_cast<int64_t>(held.size()) - 1;
+                                    log_latched(outliers_dropped, "dropped frames whose timestamps were far off the stream's");
+                                    held.clear();
+                                }
+                                accept(std::move(av_frame), duration_pts);
+                            } else if (!held.empty() && held_next != AV_NOPTS_VALUE &&
+                                       std::abs(av_frame->pts - held_next) <= threshold) {
+                                held_next = duration_pts > 0 ? av_frame->pts + duration_pts : AV_NOPTS_VALUE;
+                                held.emplace_back(std::move(av_frame), duration_pts);
+                                if (held.size() >= 3) {
+                                    // Confirmed: the stream really moved. Downstream resyncs at the
+                                    // first frame of the new timeline (see run()).
+                                    discontinuity_time = av_rescale_q(held.front().first->pts, st->time_base, TIME_BASE_Q);
+                                    discontinuity      = true;
+                                    for (auto& h : held) {
+                                        accept(std::move(h.first), h.second);
+                                    }
+                                    held.clear();
+                                }
+                            } else {
+                                if (!held.empty()) {
+                                    outliers_dropped += static_cast<int64_t>(held.size()) - 1;
+                                    log_latched(outliers_dropped, "dropped frames whose timestamps were far off the stream's");
+                                }
+                                held.clear();
+                                held_next = duration_pts > 0 ? av_frame->pts + duration_pts : AV_NOPTS_VALUE;
+                                held.emplace_back(std::move(av_frame), duration_pts);
                             }
+                            continue;
                         }
                     consecutive_failures = 0;
                 } catch (boost::thread_interrupted&) {
