@@ -135,7 +135,11 @@ class executor final
 
         task_t task;
 
-        while (is_running_) {
+        // Not `while (is_running_)` (upstream 5e27ec1c2, #1687): stop() can run before this thread
+        // first reaches the loop -- a short-lived executor, as a BEGIN/COMMIT batch uses -- and the
+        // thread then exited without running what was already queued. The nullptr task stop()
+        // enqueues is the only exit, so a queue is always drained first.
+        while (true) {
             try {
                 queue_.pop(task);
                 do {
