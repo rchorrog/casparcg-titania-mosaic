@@ -55,6 +55,10 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
+
+// FFMPEG_NEW_CHANNEL_LAYOUT: the same switch the ffmpeg module uses, so this builds on FFmpeg 4.4
+// (Ubuntu 22.04, which CI and the .deb build) as well as on 6.x/7.x.
+#include <modules/ffmpeg/defines.h>
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
@@ -253,7 +257,12 @@ std::string run_export(const std::vector<job>& jobs, const boost::filesystem::pa
         ac_guard.reset(ac);
         ac->sample_fmt  = AV_SAMPLE_FMT_S32; // the top 24 bits of CasparCG's int32 samples
         ac->sample_rate = fmt.sample_rate;
+#if FFMPEG_NEW_CHANNEL_LAYOUT
         av_channel_layout_default(&ac->ch_layout, fmt.audio_channels);
+#else
+        ac->channels       = fmt.audio_channels;
+        ac->channel_layout = av_get_default_channel_layout(fmt.audio_channels);
+#endif
         ac->time_base = av_make_q(1, fmt.sample_rate);
         if (oc->oformat->flags & AVFMT_GLOBALHEADER)
             ac->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -327,7 +336,12 @@ std::string run_export(const std::vector<job>& jobs, const boost::filesystem::pa
                 std::unique_ptr<AVFrame, void (*)(AVFrame*)> af_guard(af, [](AVFrame* fr) { av_frame_free(&fr); });
                 af->format      = AV_SAMPLE_FMT_S32;
                 af->sample_rate = fmt.sample_rate;
+#if FFMPEG_NEW_CHANNEL_LAYOUT
                 av_channel_layout_copy(&af->ch_layout, &ac->ch_layout);
+#else
+                af->channels       = ac->channels;
+                af->channel_layout = ac->channel_layout;
+#endif
                 af->nb_samples = nb;
                 if (nb > 0 && av_frame_get_buffer(af, 0) >= 0) {
                     std::memcpy(af->data[0], audio.data(), static_cast<size_t>(nb) * fmt.audio_channels * sizeof(int32_t));

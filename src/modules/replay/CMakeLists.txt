@@ -1,17 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 project(replay)
 
-include(FetchContent)
-FetchContent_Declare(
-    libvmx_ext
-    GIT_REPOSITORY https://github.com/openmediatransport/libvmx.git
-    # PINNED (W13): `master` re-fetched whatever upstream had that day into a build that measures
-    # 10-bit decode at 1 LSB. a1828cb4 (2026-09-23, "Fixed RGB<>YUV constants") is what every
-    # measurement of replay v2 was taken on. Move it deliberately, with the replay battery.
-    GIT_TAG        a1828cb438823ebb777dcad20f9f56b633ae8db4
-)
-FetchContent_MakeAvailable(libvmx_ext)
-set(LIBVMX_ROOT "${libvmx_ext_SOURCE_DIR}")
+# libvmx (MIT, https://github.com/openmediatransport/libvmx) is VENDORED in ./libvmx, at commit
+# a1828cb438823ebb777dcad20f9f56b633ae8db4 (2026-09-23, "Fixed RGB<>YUV constants") -- the commit
+# every replay v2 measurement was taken on. Only the x86/AVX2 sources and headers are kept.
+#
+# Not FetchContent: the .deb build (debhelper, Ubuntu 24.04) configures with
+# FETCHCONTENT_FULLY_DISCONNECTED=ON, so a configure-time download has no network and the
+# sources never arrive. To move libvmx, copy the new src/ files here and rerun
+# tools/test/replay_test.py.
+set(LIBVMX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/libvmx")
 
 # Include sources to compile libvmx natively
 add_library(libvmx STATIC

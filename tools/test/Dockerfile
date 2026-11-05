@@ -1,7 +1,6 @@
 # Imagen de PRUEBA: compila el árbol en Ubuntu 24.04 (lo que corren mosaic1/2/4/5) y ejecuta
 # tools/test/replay_test.py dentro del contenedor. No es la imagen de producción
-# (tools/linux/Dockerfile), que parte de jammy y cuyo FFmpeg 4.4 no tiene la API ch_layout que
-# ya usa el módulo ffmpeg de este árbol.
+# (tools/linux/Dockerfile, que parte de jammy): esta añade una etapa que ejecuta la prueba.
 #
 #   docker build -f tools/test/Dockerfile -t casparcg-replay-test .
 #
