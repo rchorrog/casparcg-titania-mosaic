@@ -24,6 +24,7 @@
 #include <boost/algorithm/string/split.hpp>
 
 #include "ProtocolStrategy.h"
+#include <common/log.h>
 #include "protocol_strategy.h"
 
 namespace caspar { namespace IO {
@@ -58,8 +59,15 @@ class to_unicode_adapter_factory : public protocol_strategy_factory<char>
 template <class CharT>
 class delimiter_based_chunking_strategy : public protocol_strategy<CharT>
 {
+    /// The longest line held while waiting for its delimiter. Uncapped, `input_ += data` grew for
+    /// as long as a peer sent bytes without a CRLF, and every read rescanned the whole buffer. A
+    /// line past the cap is DISCARDED up to its delimiter, so its tail is not parsed as a command.
+    static constexpr std::size_t max_line = 64u * 1024u * 1024u;
+
     std::basic_string<CharT>               delimiter_;
     std::basic_string<CharT>               input_;
+    std::size_t                            scanned_    = 0;     //< input_ before this holds no delimiter
+    bool                                   discarding_ = false; //< inside an over-long line
     typename protocol_strategy<CharT>::ptr strategy_;
 
   public:
@@ -70,16 +78,54 @@ class delimiter_based_chunking_strategy : public protocol_strategy<CharT>
     {
     }
 
+    // THE WHOLE DELIMITER, EVERY TIME, and the line CONSUMED BEFORE IT IS PARSED (from CasparVP).
+    //
+    // The first delimiter of a read was found with `find` and every later one with
+    // `find_first_of`, which matches EITHER character. So a read ending between the CR and the LF
+    // of a line that was not the first of that read parsed and EXECUTED the line, then threw
+    // out_of_range from `substr` before `input_` was reassigned -- and the next read completed the
+    // CRLF and the same line ran a SECOND time. Measured with tools/test/live_input_test.py:
+    // "VERSION<CR><LF>VERSION<CR>" then "<LF>" gave three replies. A lone CR or LF inside a
+    // later line
+    // also split it there.
     void parse(const std::basic_string<CharT>& data) override
     {
         input_ += data;
 
-        auto delim_pos = input_.find(delimiter_);
-        while (delim_pos != std::string::npos) {
-            strategy_->parse(input_.substr(0, delim_pos));
+        for (;;) {
+            const auto delim_pos = input_.find(delimiter_, scanned_);
+            if (delim_pos == std::basic_string<CharT>::npos) {
+                // Rescan only where a delimiter could still begin: its first character may be the
+                // last one received.
+                const auto keep = delimiter_.size() > 0 ? delimiter_.size() - 1 : 0;
+                scanned_        = input_.size() > keep ? input_.size() - keep : 0;
+                if (input_.size() > max_line) {
+                    if (!discarding_)
+                        CASPAR_LOG(error) << L"[amcp] a line exceeded " << max_line
+                                          << L" characters without a delimiter; discarding it";
+                    input_.erase(0, scanned_);
+                    scanned_    = 0;
+                    discarding_ = true;
+                }
+                return;
+            }
 
-            input_    = std::move(input_.substr(delim_pos + delimiter_.size()));
-            delim_pos = input_.find_first_of(delimiter_);
+            auto line = input_.substr(0, delim_pos);
+            input_.erase(0, delim_pos + delimiter_.size());
+            scanned_ = 0;
+
+            if (discarding_) {
+                // The end of the over-long line: drop it, and resume with what follows.
+                discarding_ = false;
+                continue;
+            }
+
+            try {
+                strategy_->parse(line);
+            } catch (const std::exception& e) {
+                // One bad line must not strand the complete lines behind it in `input_`.
+                CASPAR_LOG(error) << L"[amcp] a line could not be parsed: " << e.what();
+            }
         }
     }
 };
