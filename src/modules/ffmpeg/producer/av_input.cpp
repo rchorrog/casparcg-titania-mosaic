@@ -156,7 +156,9 @@ void Input::run_read_loop()
 
 Input::~Input()
 {
-    graph_         = spl::shared_ptr<diagnostics::graph>();
+    // `graph_` is NOT reset here any more (upstream #1748): the read thread calls
+    // graph_->set_value() until it is joined below, and reassigning a shared_ptr another thread
+    // is reading is a data race. It is released with the object, after the join.
     abort_request_ = true;
     ic_cond_.notify_all();
 
@@ -180,8 +182,11 @@ bool Input::try_pop(std::shared_ptr<AVPacket>& packet)
     return result;
 }
 
-AVFormatContext*       Input::operator->() { return ic_.get(); }
-AVFormatContext* const Input::operator->() const { return ic_.get(); }
+std::shared_ptr<AVFormatContext> Input::context() const
+{
+    std::lock_guard<std::mutex> lock(published_mutex_);
+    return published_;
+}
 
 void Input::abort()
 {
@@ -302,6 +307,10 @@ void Input::internal_reset()
 
     FF(avformat_find_stream_info(ic2.get(), nullptr));
     ic_ = std::move(ic2);
+    {
+        std::lock_guard<std::mutex> lock(published_mutex_);
+        published_ = ic_;
+    }
     ic_cond_.notify_all();
 }
 

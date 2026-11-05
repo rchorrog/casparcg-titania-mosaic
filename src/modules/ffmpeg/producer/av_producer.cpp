@@ -124,14 +124,51 @@ core::color_space get_color_space(const std::shared_ptr<AVFrame>& video)
     return result;
 }
 
+/// Consecutive failed decode iterations after which a decoder is replaced rather than retried.
+/// Generous on purpose: a lossy live feed can deliver a long run of corrupt packets, and each
+/// one is dropped and survived; only a decoder that never succeeds again is rebuilt.
+constexpr int kDecoderRebuildAfter = 100;
+
+/// The FFmpeg call and error of the exception in flight, for a one-line log.
+inline std::string describe_current_exception()
+{
+    try {
+        throw;
+    } catch (const ffmpeg_error_t& ex) {
+        std::string out;
+        if (const auto* fn = boost::get_error_info<boost::errinfo_api_function>(ex)) {
+            out += *fn;
+        }
+        if (const auto* errn = boost::get_error_info<ffmpeg_errn_info>(ex)) {
+            char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_strerror(*errn, buf, sizeof(buf));
+            out += std::string(out.empty() ? "" : ": ") + buf;
+        }
+        return out.empty() ? std::string("ffmpeg error") : out;
+    } catch (const std::exception& ex) {
+        return ex.what();
+    } catch (...) {
+        return "unknown exception";
+    }
+}
+
 class Decoder
 {
     Decoder(const Decoder&)            = delete;
     Decoder& operator=(const Decoder&) = delete;
 
-    AVStream*         st       = nullptr;
-    int64_t           next_pts = AV_NOPTS_VALUE;
-    std::atomic<bool> eof      = {false};
+    /// The format context `st` belongs to. Held so `st` stays valid for this decoder's whole
+    /// life: a live input's reconnect (Input::internal_reset) replaces the context, and the old
+    /// one used to be freed while this thread still read st->time_base and its parser.
+    std::shared_ptr<AVFormatContext> owner;
+    AVStream*                        st       = nullptr;
+    int64_t                          next_pts = AV_NOPTS_VALUE;
+    std::atomic<bool>                eof      = {false};
+
+    /// Set once kDecoderRebuildAfter iterations in a row have failed; consumed by the producer
+    /// thread, which replaces this decoder. See the decode loop.
+    std::atomic<bool> broken         = {false};
+    int64_t           failures_total = 0;
 
     /// Set by the decode thread when the source's timeline jumps; consumed once by the
     /// producer thread, which rebuilds the filter graph. See the detection site below for why
@@ -164,8 +201,9 @@ class Decoder
 
     Decoder() = default;
 
-    explicit Decoder(AVStream* stream)
-        : st(stream)
+    Decoder(AVStream* stream, std::shared_ptr<AVFormatContext> owner_context)
+        : owner(std::move(owner_context))
+        , st(stream)
     {
         const auto codec = get_decoder(stream->codecpar->codec_id);
 
@@ -210,130 +248,160 @@ class Decoder
         FF(avcodec_open2(ctx.get(), codec, nullptr));
 
         thread = boost::thread([=]() {
-            try {
-                while (!thread.interruption_requested()) {
-                    auto av_frame = alloc_frame();
-                    auto ret      = avcodec_receive_frame(ctx.get(), av_frame.get());
+            // ── The try is INSIDE the loop, and that is the fix ─────────────────────────────
+            // It used to wrap the whole loop, with `eof = true` in the catch. On a live input one
+            // corrupt packet makes avcodec_send_packet return AVERROR_INVALIDDATA -- routine after
+            // SRT/UDP loss -- and FF() throws: the thread ended and the stream was dead until the
+            // next PLAY, because a reconnect keeps its decoders. Measured on WSL with
+            // tools/test/live_input_test.py: 3 s of corrupted MPEG-TS left video AND audio dead for
+            // good. Now a failing iteration drops its packet and the next one carries on; only
+            // kDecoderRebuildAfter failures IN A ROW ask the producer to rebuild this decoder.
+            //
+            // boost::this_thread, not `thread.interruption_requested()`: `thread` is the member
+            // being assigned by this very statement, so the worker read it while it was written.
+            int consecutive_failures = 0;
+            while (!boost::this_thread::interruption_requested()) {
+                try {
+                        auto av_frame = alloc_frame();
+                        auto ret      = avcodec_receive_frame(ctx.get(), av_frame.get());
 
-                    if (ret == AVERROR(EAGAIN)) {
-                        std::shared_ptr<AVPacket> packet;
-                        {
-                            boost::unique_lock<boost::mutex> lock(input_mutex);
-                            input_cond.wait(lock, [&]() { return !input.empty(); });
-                            packet = std::move(input.front());
-                            input.pop();
-                        }
-                        FF(avcodec_send_packet(ctx.get(), packet.get()));
-                    } else if (ret == AVERROR_EOF) {
-                        avcodec_flush_buffers(ctx.get());
-                        av_frame->pts = next_pts;
-                        next_pts      = AV_NOPTS_VALUE;
-                        eof           = true;
-
-                        {
-                            boost::unique_lock<boost::mutex> lock(output_mutex);
-                            output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
-                            output.push(std::move(av_frame));
-                        }
-                    } else {
-                        FF_RET(ret, "avcodec_receive_frame");
-
-                        // TODO: Maybe Fixed in:
-                        // https://github.com/FFmpeg/FFmpeg/commit/33203a08e0a26598cb103508327a1dc184b27bc6
-                        // NOTE This is a workaround for DVCPRO HD.
-#if LIBAVCODEC_VERSION_MAJOR < 61
-                        if (av_frame->width > 1024 && av_frame->interlaced_frame) {
-                            av_frame->top_field_first = 1;
-                        }
-#else
-                        if (av_frame->width > 1024 && (av_frame->flags & AV_FRAME_FLAG_INTERLACED)) {
-                            av_frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
-                        }
-#endif
-
-                        // TODO (fix) is this always best?
-                        av_frame->pts = av_frame->best_effort_timestamp;
-
-                        // ── Discontinuity detection, and it has to be HERE ──────────────
-                        // This is the last point where the timestamp is still the source's
-                        // own. Downstream, `vf_fps` replaces it with a counter
-                        // (`libavfilter/vf_fps.c:305`: `frame->pts = s->next_pts++`), so a
-                        // jump is undetectable from `Frame::pts` -- and worse, `vf_fps` never
-                        // re-seeds that counter, so after a jump it silently drops every
-                        // frame (backward) or duplicates one (forward) until the gap is made
-                        // up. A 33-bit MPEG-TS PTS wrap is ~26.5 h, so on a 24/7 wall that is
-                        // a tile frozen for a day, with a healthy-looking buffer and no
-                        // underflow tag anywhere.
-                        //
-                        // Threshold, not equality: normal jitter and B-frame reordering move
-                        // the timestamp around by a frame or two. Five seconds in stream time
-                        // is far past anything legitimate and far below a wrap.
-                        if (next_pts != AV_NOPTS_VALUE && av_frame->pts != AV_NOPTS_VALUE) {
-                            const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
-                            if (std::abs(av_frame->pts - next_pts) > threshold) {
-                                discontinuity_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
-                                discontinuity      = true;
+                        if (ret == AVERROR(EAGAIN)) {
+                            std::shared_ptr<AVPacket> packet;
+                            {
+                                boost::unique_lock<boost::mutex> lock(input_mutex);
+                                input_cond.wait(lock, [&]() { return !input.empty(); });
+                                packet = std::move(input.front());
+                                input.pop();
                             }
-                        }
+                            FF(avcodec_send_packet(ctx.get(), packet.get()));
+                        } else if (ret == AVERROR_EOF) {
+                            avcodec_flush_buffers(ctx.get());
+                            av_frame->pts = next_pts;
+                            next_pts      = AV_NOPTS_VALUE;
+                            eof           = true;
 
-                        // Publish the SOURCE timestamp, for the same reason the check above sits
-                        // here: this is the last place it exists. Everything downstream -- and
-                        // that includes `file/time`, which is what an operator reads over OSC --
-                        // is derived from the filter graph's output, i.e. from `vf_fps`'s counter
-                        // rather than from the stream. The two agree while nothing is dropped and
-                        // diverge silently afterwards, which is exactly the failure worth
-                        // catching, and until now there was no way to see it happen.
-                        //
-                        // Rescaled to AV_TIME_BASE so it can be compared across streams whose
-                        // time bases differ; comparing raw ticks between two inputs is wrong.
-                        if (av_frame->pts != AV_NOPTS_VALUE) {
-                            source_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
-                        }
-
-#if LIBAVUTIL_VERSION_MAJOR < 58
-                        auto duration_pts = av_frame->pkt_duration;
-#else
-                        auto duration_pts = av_frame->duration;
-#endif
-                        if (duration_pts <= 0) {
-                            if (ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-#if LIBAVCODEC_VERSION_MAJOR < 62
-                                const int ticks_per_frame = ctx->ticks_per_frame;
-#else
-                                // https://github.com/FFmpeg/FFmpeg/commit/e930b834a928546f9cbc937f6633709053448232#diff-115616f8a2b59cab3aac4e7f4c8c31e69e94e7fcfa339b9f65b0bf34308aa80fR682
-                                const int ticks_per_frame =
-                                    (ctx->codec_descriptor && (ctx->codec_descriptor->props & AV_CODEC_PROP_FIELDS))
-                                        ? 2
-                                        : 1;
-#endif
-                                const auto ticks = av_stream_get_parser(st) ? av_stream_get_parser(st)->repeat_pict + 1
-                                                                            : ticks_per_frame;
-                                duration_pts     = static_cast<int64_t>(AV_TIME_BASE) * ctx->framerate.den * ticks /
-                                               ctx->framerate.num / ticks_per_frame;
-                                duration_pts = av_rescale_q(duration_pts, {1, AV_TIME_BASE}, st->time_base);
-                            } else if (ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
-                                duration_pts = av_rescale_q(av_frame->nb_samples, {1, ctx->sample_rate}, st->time_base);
+                            {
+                                boost::unique_lock<boost::mutex> lock(output_mutex);
+                                output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
+                                output.push(std::move(av_frame));
                             }
-                        }
-
-                        if (duration_pts > 0) {
-                            next_pts = av_frame->pts + duration_pts;
                         } else {
-                            next_pts = AV_NOPTS_VALUE;
-                        }
+                            FF_RET(ret, "avcodec_receive_frame");
 
-                        {
-                            boost::unique_lock<boost::mutex> lock(output_mutex);
-                            output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
-                            output.push(std::move(av_frame));
+                            // TODO: Maybe Fixed in:
+                            // https://github.com/FFmpeg/FFmpeg/commit/33203a08e0a26598cb103508327a1dc184b27bc6
+                            // NOTE This is a workaround for DVCPRO HD.
+    #if LIBAVCODEC_VERSION_MAJOR < 61
+                            if (av_frame->width > 1024 && av_frame->interlaced_frame) {
+                                av_frame->top_field_first = 1;
+                            }
+    #else
+                            if (av_frame->width > 1024 && (av_frame->flags & AV_FRAME_FLAG_INTERLACED)) {
+                                av_frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+                            }
+    #endif
+
+                            // TODO (fix) is this always best?
+                            av_frame->pts = av_frame->best_effort_timestamp;
+
+                            // ── Discontinuity detection, and it has to be HERE ──────────────
+                            // This is the last point where the timestamp is still the source's
+                            // own. Downstream, `vf_fps` replaces it with a counter
+                            // (`libavfilter/vf_fps.c:305`: `frame->pts = s->next_pts++`), so a
+                            // jump is undetectable from `Frame::pts` -- and worse, `vf_fps` never
+                            // re-seeds that counter, so after a jump it silently drops every
+                            // frame (backward) or duplicates one (forward) until the gap is made
+                            // up. A 33-bit MPEG-TS PTS wrap is ~26.5 h, so on a 24/7 wall that is
+                            // a tile frozen for a day, with a healthy-looking buffer and no
+                            // underflow tag anywhere.
+                            //
+                            // Threshold, not equality: normal jitter and B-frame reordering move
+                            // the timestamp around by a frame or two. Five seconds in stream time
+                            // is far past anything legitimate and far below a wrap.
+                            if (next_pts != AV_NOPTS_VALUE && av_frame->pts != AV_NOPTS_VALUE) {
+                                const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
+                                if (std::abs(av_frame->pts - next_pts) > threshold) {
+                                    discontinuity_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
+                                    discontinuity      = true;
+                                }
+                            }
+
+                            // Publish the SOURCE timestamp, for the same reason the check above sits
+                            // here: this is the last place it exists. Everything downstream -- and
+                            // that includes `file/time`, which is what an operator reads over OSC --
+                            // is derived from the filter graph's output, i.e. from `vf_fps`'s counter
+                            // rather than from the stream. The two agree while nothing is dropped and
+                            // diverge silently afterwards, which is exactly the failure worth
+                            // catching, and until now there was no way to see it happen.
+                            //
+                            // Rescaled to AV_TIME_BASE so it can be compared across streams whose
+                            // time bases differ; comparing raw ticks between two inputs is wrong.
+                            if (av_frame->pts != AV_NOPTS_VALUE) {
+                                source_time = av_rescale_q(av_frame->pts, st->time_base, TIME_BASE_Q);
+                            }
+
+    #if LIBAVUTIL_VERSION_MAJOR < 58
+                            auto duration_pts = av_frame->pkt_duration;
+    #else
+                            auto duration_pts = av_frame->duration;
+    #endif
+                            if (duration_pts <= 0) {
+                                if (ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+    #if LIBAVCODEC_VERSION_MAJOR < 62
+                                    const int ticks_per_frame = ctx->ticks_per_frame;
+    #else
+                                    // https://github.com/FFmpeg/FFmpeg/commit/e930b834a928546f9cbc937f6633709053448232#diff-115616f8a2b59cab3aac4e7f4c8c31e69e94e7fcfa339b9f65b0bf34308aa80fR682
+                                    const int ticks_per_frame =
+                                        (ctx->codec_descriptor && (ctx->codec_descriptor->props & AV_CODEC_PROP_FIELDS))
+                                            ? 2
+                                            : 1;
+    #endif
+                                    const auto ticks = av_stream_get_parser(st) ? av_stream_get_parser(st)->repeat_pict + 1
+                                                                                : ticks_per_frame;
+                                    duration_pts     = static_cast<int64_t>(AV_TIME_BASE) * ctx->framerate.den * ticks /
+                                                   ctx->framerate.num / ticks_per_frame;
+                                    duration_pts = av_rescale_q(duration_pts, {1, AV_TIME_BASE}, st->time_base);
+                                } else if (ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
+                                    duration_pts = av_rescale_q(av_frame->nb_samples, {1, ctx->sample_rate}, st->time_base);
+                                }
+                            }
+
+                            if (duration_pts > 0) {
+                                next_pts = av_frame->pts + duration_pts;
+                            } else {
+                                next_pts = AV_NOPTS_VALUE;
+                            }
+
+                            {
+                                boost::unique_lock<boost::mutex> lock(output_mutex);
+                                output_cond.wait(lock, [&]() { return output.size() < output_capacity; });
+                                output.push(std::move(av_frame));
+                            }
+                        }
+                    consecutive_failures = 0;
+                } catch (boost::thread_interrupted&) {
+                    return;
+                } catch (...) {
+                    failures_total += 1;
+                    consecutive_failures += 1;
+                    if (failures_total == 1 || failures_total % 100 == 0) {
+                        // Latched: a lossy feed produces these by the hundred, across many layers.
+                        CASPAR_LOG(warning) << "[ffmpeg] decoder (" << av_get_media_type_string(ctx->codec_type)
+                                            << ") dropped a packet it could not decode: "
+                                            << describe_current_exception() << " (" << failures_total << " so far)";
+                    }
+                    if (consecutive_failures == kDecoderRebuildAfter) {
+                        broken = true;
+                    }
+                    if (consecutive_failures >= kDecoderRebuildAfter) {
+                        // Waiting to be replaced; do not spin while that happens.
+                        try {
+                            boost::this_thread::sleep_for(boost::chrono::milliseconds(10));
+                        } catch (boost::thread_interrupted&) {
+                            return;
                         }
                     }
                 }
-            } catch (boost::thread_interrupted&) {
-                // Do nothing...
-            } catch (...) {
-                eof = true;
-                CASPAR_LOG_CURRENT_EXCEPTION();
             }
         });
     }
@@ -353,6 +421,13 @@ class Decoder
     /// True once since the last call: this stream's timeline jumped. Consumed by the producer
     /// thread, which rebuilds the filter graph so `vf_fps` re-seeds its output counter.
     bool take_discontinuity() { return discontinuity.exchange(false); }
+
+    /// True once since the last call: this decoder has failed kDecoderRebuildAfter times in a
+    /// row and should be replaced.
+    bool take_broken() { return broken.exchange(false); }
+
+    /// The time base of this decoder's own stream (kept alive by `owner`).
+    AVRational time_base() const { return st->time_base; }
 
     /// Where the new timeline starts (see `discontinuity_time`); AV_NOPTS_VALUE if unknown.
     int64_t take_discontinuity_time() { return discontinuity_time.exchange(AV_NOPTS_VALUE); }
@@ -427,6 +502,14 @@ struct Filter
            AVMediaType                    media_type,
            const core::video_format_desc& format_desc)
     {
+        // ONE snapshot of the input's context for the whole construction, also handed to every
+        // decoder created here: a reconnect on the read thread can replace the context at any
+        // moment, and each `input->` alone would otherwise be free to see a different one.
+        const auto input_ctx = input.context();
+        if (!input_ctx) {
+            FF_RET(AVERROR(EINVAL), "Filter: input has no format context");
+        }
+
         if (media_type == AVMEDIA_TYPE_VIDEO) {
             if (filter_spec.empty()) {
                 filter_spec = "null";
@@ -450,8 +533,8 @@ struct Filter
 
             // Find first audio stream to get a time_base for the first_pts calculation
             AVRational tb = {1, format_desc.audio_sample_rate};
-            for (auto n = 0U; n < input->nb_streams; ++n) {
-                const auto st = input->streams[n];
+            for (auto n = 0U; n < input_ctx->nb_streams; ++n) {
+                const auto st = input_ctx->streams[n];
 #if FFMPEG_NEW_CHANNEL_LAYOUT
                 const auto codec_channels = st->codecpar->ch_layout.nb_channels;
 #else
@@ -507,8 +590,8 @@ struct Filter
         }
 
         std::vector<AVStream*> av_streams;
-        for (auto n = 0U; n < input->nb_streams; ++n) {
-            const auto st = input->streams[n];
+        for (auto n = 0U; n < input_ctx->nb_streams; ++n) {
+            const auto st = input_ctx->streams[n];
 
 #if FFMPEG_NEW_CHANNEL_LAYOUT
             const auto codec_channels = st->codecpar->ch_layout.nb_channels;
@@ -600,7 +683,11 @@ struct Filter
 
                 auto it = streams.find(index);
                 if (it == streams.end()) {
-                    it = streams.emplace(index, input->streams[index]).first;
+                    it = streams
+                             .emplace(std::piecewise_construct,
+                                      std::forward_as_tuple(index),
+                                      std::forward_as_tuple(input_ctx->streams[index], input_ctx))
+                             .first;
                 }
 
                 auto st = it->second.ctx;
@@ -853,6 +940,15 @@ struct AVProducer::Impl
     int64_t drops_            = 0;
     int64_t repeats_          = 0;
     int64_t discontinuities_  = 0;
+
+    /// Set by schedule() when the filter graph refuses a frame (in-band change of size, format or
+    /// rate); consumed by run(), which rebuilds the graph. Producer thread only.
+    bool filters_stale_ = false;
+
+    /// The video decoder's latest SOURCE timestamp, mirrored by the producer thread for
+    /// update_state(). update_state() runs on the channel and AMCP threads, and used to walk
+    /// `decoders_` -- a std::map the producer thread clears and erases from -- to read it.
+    std::atomic<int64_t> video_source_time_{AV_NOPTS_VALUE};
     int64_t last_correction_  = 0;
 
     /// Mirror of `buffer_.size()`, published under `buffer_mutex_` and read without it.
@@ -963,8 +1059,9 @@ struct AVProducer::Impl
         input_.open();
         {
             core::monitor::state streams;
-            for (auto n = 0UL; n < input_->nb_streams; ++n) {
-                auto st                             = input_->streams[n];
+            const auto           ic = input_.context(); // one context for the whole loop
+            for (auto n = 0UL; n < ic->nb_streams; ++n) {
+                auto st                             = ic->streams[n];
                 auto framerate                      = av_guess_frame_rate(nullptr, st, nullptr);
                 streams[std::to_string(n) + "/fps"] = {framerate.num, framerate.den};
             }
@@ -1032,7 +1129,32 @@ struct AVProducer::Impl
                 // counter. `seek_internal` already does exactly this for seeks; a
                 // discontinuity needs the same treatment without moving the read position,
                 // which for a live input is not seekable anyway.
-                bool discontinuity = input_.take_discontinuity();
+                //
+                // Three more causes take the same path (2026-11), each measured with
+                // tools/test/live_input_test.py before it was fixed:
+                //  * a RECONNECT also rebuilds the decoders. They used to survive it, pointing into
+                //    the format context the reconnect had just freed, and configured for the old
+                //    stream: an SRT sender back at another resolution left the video frozen.
+                //  * a decoder that failed kDecoderRebuildAfter times in a row is replaced.
+                //  * a frame the filter graph refuses (`filters_stale_`: the stream changed size,
+                //    pixel format or sample rate in-band) rebuilds the graph from the decoders'
+                //    current parameters. That refusal used to end the producer thread.
+                const bool reconnected  = input_.take_discontinuity();
+                const bool filter_stale = std::exchange(filters_stale_, false);
+                bool       discontinuity = reconnected || filter_stale;
+                std::vector<int> broken;
+                for (auto& p : decoders_) {
+                    if (p.second.take_broken()) {
+                        broken.push_back(p.first);
+                    }
+                }
+                discontinuity |= !broken.empty();
+                // Where the stream is NOW, for the causes that are not a time jump: seeding the
+                // rebuilt graph at the PLAY's start_time is the 2026-10-05 defect below.
+                int64_t current_source_time = AV_NOPTS_VALUE;
+                for (auto& p : decoders_) {
+                    current_source_time = std::max(current_source_time, p.second.take_source_time());
+                }
                 // Earliest new-timeline timestamp among the decoders that saw the jump;
                 // AV_NOPTS_VALUE when only Input reported (a real reconnect, which already
                 // renews input_->start_time).
@@ -1057,6 +1179,18 @@ struct AVProducer::Impl
                                          << discontinuities_ << " so far)";
                     }
                     graph_->set_tag(diagnostics::tag_severity::WARNING, "discontinuity");
+                    if (reconnected) {
+                        decoders_.clear();
+                    } else {
+                        for (const auto index : broken) {
+                            CASPAR_LOG(warning) << print() << " decoder for stream " << index << " failed "
+                                                << kDecoderRebuildAfter << " times in a row; replacing it";
+                            decoders_.erase(index);
+                        }
+                    }
+                    if (resync_time == AV_NOPTS_VALUE && !reconnected) {
+                        resync_time = current_source_time;
+                    }
 
                     // Not `seek_internal`: a live stream cannot seek, and asking it to would
                     // fail or reopen. Only the filter graph's notion of time is stale.
@@ -1106,6 +1240,15 @@ struct AVProducer::Impl
             bool progress = false;
             {
                 progress |= schedule();
+
+                // Mirror the video decoder's source clock for update_state(), which must not touch
+                // `decoders_` (see video_source_time_).
+                for (auto& p : decoders_) {
+                    if (p.second.ctx && p.second.ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+                        video_source_time_ = p.second.take_source_time();
+                        break;
+                    }
+                }
 
                 // Filtros en el propio hilo del producer. Antes cada pasada del bucle (cada ~5 ms con
                 // fuentes en directo) mandaba el filtro de vídeo y el de audio a dos executors propios
@@ -1251,13 +1394,7 @@ struct AVProducer::Impl
         // comparable between layers, which `file/time` is not, because each producer normalises
         // against its own `input_->start_time`.
         {
-            int64_t src = AV_NOPTS_VALUE;
-            for (auto& p : decoders_) {
-                if (p.second.ctx && p.second.ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-                    src = p.second.take_source_time();
-                    break;
-                }
-            }
+            const int64_t src = video_source_time_.load();
 
             // NOTA DE LA FUSION: el PR original leia esto via `input_.operator->()` (→
             // `ic_.get()` sin bloquear `ic_mutex_`, ver av_input.h/cpp) directamente aqui, en
@@ -1500,6 +1637,28 @@ struct AVProducer::Impl
     }
 
   private:
+    /// Whether `frame` has the format the buffer source `source` was configured for, read from
+    /// the source's output link so there is no second copy of those parameters to drift.
+    static bool matches_source(const AVFilterContext* source, const AVFrame& frame)
+    {
+        if (!source || source->nb_outputs < 1 || !source->outputs[0]) {
+            return true;
+        }
+        const AVFilterLink* link = source->outputs[0];
+        if (link->type == AVMEDIA_TYPE_VIDEO) {
+            return frame.width == link->w && frame.height == link->h && frame.format == link->format;
+        }
+        if (link->type == AVMEDIA_TYPE_AUDIO) {
+#if FFMPEG_NEW_CHANNEL_LAYOUT
+            const bool same_channels = frame.ch_layout.nb_channels == link->ch_layout.nb_channels;
+#else
+            const bool same_channels = frame.channels == link->channels;
+#endif
+            return frame.format == link->format && frame.sample_rate == link->sample_rate && same_channels;
+        }
+        return true;
+    }
+
     bool want_packet()
     {
         return std::any_of(decoders_.begin(), decoders_.end(), [](auto& p) { return p.second.want_packet(); });
@@ -1549,15 +1708,33 @@ struct AVProducer::Impl
             }
 
             if (frame->data[0] && frame->nb_samples > 0) {
-                align_audio(p.first, *frame);
+                align_audio(p.first, it->second.time_base(), *frame);
             }
 
             for (auto& source : p.second) {
                 if (!frame->data[0]) {
                     FF(av_buffersrc_close(source, frame->pts, 0));
+                } else if (!matches_source(source, *frame)) {
+                    // The stream changed size, pixel format, sample rate or channels IN-BAND (an
+                    // encoder restarted on the same UDP port, a resolution switch upstream).
+                    // FFmpeg 6.1's buffersrc accepts such a frame with a warning and the filter
+                    // after it fails instead ("bwdif: Failed to reallocate frame"), which left the
+                    // layer frozen. Drop it and let run() rebuild the graph from the decoder's
+                    // current parameters.
+                    filters_stale_ = true;
+                    continue;
                 } else {
                     // TODO (fix) Guard against overflow?
-                    FF(av_buffersrc_write_frame(source, frame.get()));
+                    const auto ret = av_buffersrc_write_frame(source, frame.get());
+                    if (ret == AVERROR(EINVAL)) {
+                        // The graph was configured for another size, pixel format or sample rate
+                        // ("Changing video frame properties on the fly is not supported"). Drop
+                        // this frame and let run() rebuild the graph; throwing here ended the
+                        // producer thread and froze the layer until the next PLAY.
+                        filters_stale_ = true;
+                        continue;
+                    }
+                    FF_RET(ret, "av_buffersrc_write_frame");
                 }
                 result = true;
             }
@@ -1606,13 +1783,12 @@ struct AVProducer::Impl
     /// a esa y a las siguientes. Por debajo de 2 s no se toca nada: los micro-cortes los sigue tapando
     /// aresample. La sincronía no depende de esto: cada frame de salida empareja vídeo y audio por
     /// orden de llegada, no por pts.
-    void align_audio(int index, AVFrame& frame)
+    void align_audio(int index, AVRational tb, AVFrame& frame)
     {
         if (frame.pts == AV_NOPTS_VALUE || frame.sample_rate <= 0) {
             return;
         }
 
-        const auto tb       = input_->streams[index]->time_base;
         auto&      timeline = audio_timelines_[index];
         const auto expected = timeline.next != AV_NOPTS_VALUE ? timeline.next
                               : audio_seed_ != AV_NOPTS_VALUE ? av_rescale_q(audio_seed_, TIME_BASE_Q, tb)

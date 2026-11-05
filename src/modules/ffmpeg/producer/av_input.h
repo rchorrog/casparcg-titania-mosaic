@@ -31,9 +31,19 @@ class Input
 
     bool try_pop(std::shared_ptr<AVPacket>& packet);
 
-    AVFormatContext* operator->();
-
-    AVFormatContext* const operator->() const;
+    /// The current format context, OWNED by the caller for as long as it holds the pointer.
+    ///
+    /// A live input's read thread replaces the context on every reconnect (`internal_reset`),
+    /// and the old one is freed when its last owner lets go. Until 2026-11 these returned
+    /// `ic_.get()` with no lock, so the producer thread could read a context the read thread was
+    /// freeing. `input->field` still works: the returned shared_ptr lives until the end of the
+    /// full expression. Anything that keeps a pointer INTO the context (an AVStream*) must keep
+    /// the shared_ptr too -- see `context()` and `Decoder::owner`.
+    ///
+    /// Never takes `ic_mutex_`: the read thread holds that across a blocking av_read_frame (up
+    /// to rw_timeout), and the producer thread must not wait on the network.
+    std::shared_ptr<AVFormatContext> operator->() const { return context(); }
+    std::shared_ptr<AVFormatContext> context() const;
 
     void reset();
     /// First open, from the producer thread. Like `reset`, but a live input that fails to open
@@ -70,6 +80,10 @@ class Input
 
     mutable std::mutex               ic_mutex_;
     std::shared_ptr<AVFormatContext> ic_;
+
+    /// `ic_` as published to other threads, under a lock held only to copy the pointer.
+    mutable std::mutex               published_mutex_;
+    std::shared_ptr<AVFormatContext> published_;
     std::condition_variable          ic_cond_;
 
     tbb::concurrent_bounded_queue<std::shared_ptr<AVPacket>> buffer_;
