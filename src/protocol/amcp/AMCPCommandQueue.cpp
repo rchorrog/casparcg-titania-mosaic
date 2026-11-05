@@ -39,6 +39,43 @@ AMCPCommandQueue::AMCPCommandQueue(const std::wstring&                          
 
 AMCPCommandQueue::~AMCPCommandQueue() {}
 
+// La respuesta que se le debe al cliente para la excepcion en curso. Una sola tabla para el
+// camino sincrono y el asincrono: antes solo la tenia el sincrono, y un comando cuyo FUTURE
+// lanzaba no respondia nada -- `CALL 1-10 BANANA` sobre un producer cuyo call() lanza dejaba al
+// cliente esperando para siempre, sin una linea en el log.
+static void reply_failure(const std::shared_ptr<AMCPCommand>& cmd, bool reply_without_req_id)
+{
+    try {
+        std::rethrow_exception(std::current_exception());
+    } catch (file_not_found&) {
+        CASPAR_LOG(error) << " File not found.";
+        cmd->SendReply(L"404 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    } catch (expected_user_error&) {
+        cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    } catch (user_error& e) {
+        // El motivo, no solo el veredicto: un rechazo correcto y un error de sintaxis se leian igual.
+        if (const auto* why = boost::get_error_info<msg_info_t>(e))
+            CASPAR_LOG(error) << " Check syntax: " << *why;
+        else
+            CASPAR_LOG(error) << " Check syntax.";
+        cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    } catch (std::out_of_range&) {
+        CASPAR_LOG(error) << L"Missing parameter. Check syntax.";
+        cmd->SendReply(L"402 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    } catch (boost::bad_lexical_cast&) {
+        CASPAR_LOG(error) << L"Invalid parameter. Check syntax.";
+        cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    } catch (std::invalid_argument&) {
+        // std::stoi/std::stod sobre una palabra: un argumento mal escrito, no un error interno.
+        CASPAR_LOG(error) << L"Invalid parameter. Check syntax.";
+        cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    } catch (...) {
+        CASPAR_LOG_CURRENT_EXCEPTION();
+        CASPAR_LOG(error) << "Failed to execute command: " << cmd->name();
+        cmd->SendReply(L"501 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+    }
+}
+
 std::future<bool> exec_cmd(std::shared_ptr<AMCPCommand>                         cmd,
                            const spl::shared_ptr<std::vector<channel_context>>& channels,
                            bool                                                 reply_without_req_id)
@@ -52,30 +89,23 @@ std::future<bool> exec_cmd(std::shared_ptr<AMCPCommand>                         
 
             auto res = cmd->Execute(channels).share();
             return std::async(std::launch::async, [cmd, res, reply_without_req_id, timer, name]() -> bool {
-                cmd->SendReply(res.get(), reply_without_req_id);
+                // res.get() relanza lo que lanzo el comando diferido, y esta lambda corre fuera
+                // del try/catch de abajo: sin esto la respuesta no se enviaba nunca.
+                std::wstring reply;
+                try {
+                    reply = res.get();
+                } catch (...) {
+                    reply_failure(cmd, reply_without_req_id);
+                    return false;
+                }
+                cmd->SendReply(reply, reply_without_req_id);
 
                 CASPAR_LOG(debug) << "Executed command (" << timer.elapsed() << "s): " << name;
                 return true;
             });
 
-        } catch (file_not_found&) {
-            CASPAR_LOG(error) << " File not found.";
-            cmd->SendReply(L"404 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
-        } catch (expected_user_error&) {
-            cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
-        } catch (user_error&) {
-            CASPAR_LOG(error) << " Check syntax.";
-            cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
-        } catch (std::out_of_range&) {
-            CASPAR_LOG(error) << L"Missing parameter. Check syntax.";
-            cmd->SendReply(L"402 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
-        } catch (boost::bad_lexical_cast&) {
-            CASPAR_LOG(error) << L"Invalid parameter. Check syntax.";
-            cmd->SendReply(L"403 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
         } catch (...) {
-            CASPAR_LOG_CURRENT_EXCEPTION();
-            CASPAR_LOG(error) << "Failed to execute command: " << cmd->name();
-            cmd->SendReply(L"501 " + cmd->name() + L" FAILED\r\n", reply_without_req_id);
+            reply_failure(cmd, reply_without_req_id);
         }
 
     } catch (...) {
