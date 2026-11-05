@@ -100,6 +100,13 @@ class CorruptingRelay(threading.Thread):
                         self.corrupted += 1
             self.tx.sendto(bytes(data), self.dst)
 
+    def close(self):
+        """Stop and release both sockets, so the ports can be bound again by a later run."""
+        self.stop = True
+        self.join(2)
+        self.rx.close()
+        self.tx.close()
+
 
 def peak_db(info, layer=10):
     vals = []
@@ -159,13 +166,15 @@ def scenario_corrupt(r):
         time.sleep(3.0)
         relay.corrupt = False
         print("[info] paquetes TS corrompidos: %d" % relay.corrupted, flush=True)
-        time.sleep(5.0)
+        # 10 s: un decodificador atascado se reemplaza tras kDecoderStallPackets (~6 s a 50p).
+        # Un decodificador muerto para siempre sigue fallando aqui igual.
+        time.sleep(10.0)
         r.alive("UDP despues de la corrupcion")
     finally:
         r.a.cmd("CLEAR 1-10")
         snd.kill()
         snd.wait()
-        relay.stop = True
+        relay.close()
 
 
 def scenario_srt(r):
