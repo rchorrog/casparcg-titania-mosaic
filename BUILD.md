@@ -160,7 +160,9 @@ de `https://github.com/mko1989/highascg/releases/download/v.142/...` en vez del 
    veces; `mallinfo()` sustituido para el SIGILL de CEF de la entrada 2; estado del canal sin carrera;
    y compatibilidad con FFmpeg 8 (por debajo de 8 el código es el de antes). Detalle en cada commit.
    WebRTC: [`docs/webrtc.md`](docs/webrtc.md) — la ruta recomendada (SRT a MediaMTX) no necesita
-   cambios en CasparCG; FFmpeg 8 (WHIP nativo) **no** es apto todavía para las entradas.
+   cambios en CasparCG; FFmpeg 8 (WHIP nativo) también vale desde el filtro de línea de tiempo del
+   decodificador, que quita las congelaciones de entrada tras paquetes corruptos (0 de 40 con
+   FFmpeg 8.1.2, 0 de 20 con 6.1).
 
 ## Receta de build (misma que `build-and-deploy.sh` / Fase 4C de `setup-desde-cero.sh`)
 

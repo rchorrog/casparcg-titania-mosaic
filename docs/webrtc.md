@@ -10,7 +10,7 @@
 | ruta | qué hace falta | medido |
 | :--- | :--- | :--- |
 | **A. Pasarela** — CasparCG `STREAM` por SRT a MediaMTX, que lo sirve por WebRTC (WHEP) | **nada en CasparCG**: el binario y el FFmpeg 6.1 de hoy | 1280x720 a 50 fps completos y audio Opus a -18,0 dBFS (el seno de origen) en el receptor WebRTC |
-| **B. WHIP nativo** — CasparCG publica WebRTC directamente (`-f whip`) | CasparCG compilado contra **FFmpeg 8** (Ubuntu 24.04 trae 6.1; hay que compilarlo y llevar sus `.so`) | 1280x720 y audio Opus a -18,0 dBFS; primer frame a 0,39 s de suscribirse. Ver la advertencia de §3 |
+| **B. WHIP nativo** — CasparCG publica WebRTC directamente (`-f whip`) | CasparCG compilado contra **FFmpeg 8** (Ubuntu 24.04 trae 6.1; hay que compilarlo y llevar sus `.so`) | 1280x720 y audio Opus a -18,0 dBFS; primer frame a 0,39 s de suscribirse. Entradas estables con FFmpeg 8 desde el filtro de línea de tiempo (§3) |
 | **C. GStreamer** (el módulo de CasparVP) | portar el módulo (~5800 líneas que dependen del núcleo del fork) y compilar gst-plugins-rs: el GStreamer de Ubuntu 24.04 no trae los elementos WHIP/WHEP | no medido |
 | **Entrada WebRTC** (WHEP/WHIP hacia CasparCG) | FFmpeg no tiene demuxer WHEP. Opciones: MediaMTX recibe WHIP y CasparCG lee su SRT/RTSP; o el productor HTML (CEF) reproduce un reproductor WHEP | no medido |
 
@@ -67,22 +67,27 @@ ADD 1 STREAM "http://<mediamtx>:8889/mosaico/whip" -f whip -c:v libx264 -preset 
 Medido con CasparCG compilado contra FFmpeg 8.1.2: MediaMTX recibe la publicación WHIP con pistas
 `Opus` y `H264`, y el receptor WHEP recibe 283 frames en ~6 s a 1280x720 y audio a -18,0 dBFS.
 
-**FFmpeg 8 no es apto todavía para las ENTRADAS del mosaico.** Con FFmpeg 8.1.2, tras 3 s de
-MPEG-TS corrupto (escenario `corrupt` de `tools/test/live_input_test.py`) el vídeo de la entrada se
-quedó congelado para siempre en 2 de 7, 2 de 15 y 1 de 15 ejecuciones; con el FFmpeg 6.1 del
-sistema y el mismo código, en 0 de 19. El audio sigue sonando.
+**Las entradas con FFmpeg 8: resuelto.** Antes del filtro de línea de tiempo del decodificador, tras
+3 s de MPEG-TS corrupto (escenario `corrupt` de `tools/test/live_input_test.py`) el vídeo de la
+entrada se quedaba congelado para siempre en 2 de 7, 2 de 15 y 1 de 15 ejecuciones con FFmpeg
+8.1.2, y en 0 de 19 con el 6.1 del sistema. El audio seguía sonando.
 
-Lo medido del estado congelado: el grafo de filtros de vídeo deja de pedir frames
-(`av_buffersrc_get_nb_failed_requests` = 0) pero sigue entregando, así que repite la última imagen;
-el decodificador tiene la cola de salida llena y la de entrada crece sin límite (152 → 909
-paquetes). La causa raíz NO está establecida. Se descartaron, midiendo: un paquete vacío que cierre
-el decodificador, un fin de stream del decodificador o del filtro, una reconstrucción del grafo sin
-vídeo, y un decodificador que acepte paquetes sin devolver frames. Sembrar el grafo reconstruido sin
-`start_time` tras una discontinuidad no lo arregló (2 de 15) y empeoró FFmpeg 6.1 (la prueba de
-corrupción pasó a fallar), así que se descartó.
+La causa, reproducida fuera de CasparCG alimentando la cadena exacta del productor
+(`bwdif` → `fps`) con marcas de tiempo escritas a mano, e igual con FFmpeg 6.1 y 8.1.2: un frame
+**sin marca de tiempo** hace que el grafo emita frames sin fin sin pedir entrada; un frame con una
+marca **absurda** (3831 s dentro de un flujo en 10 s) hace que `fps` rellene el hueco con 191 073
+copias; y una resincronización sembrada en esa marca no vuelve a sacar nada. El decodificador
+produce ambos tras la corrupción (FFmpeg 8 con más frecuencia), y además una marca ausente
+envenenaba la predicción del frame siguiente, lo que provocaba 25-49 resincronizaciones por ráfaga.
 
-Para WHIP nativo con entradas fiables haría falta, por tanto, o resolver esto o no usar FFmpeg 8 en
-el mismo proceso que las entradas: es otro motivo para la ruta A.
+Ahora el decodificador solo deja pasar una línea de tiempo de confianza: un frame a más de 5 s de la
+esperada se retiene; si la línea anterior continúa, se descarta; si tres frames seguidos confirman
+la nueva, el salto es real y se acepta. Un frame sin marca toma la esperada, o se descarta mientras
+un salto está sin confirmar. Medido: **0 de 40** congelaciones con FFmpeg 8.1.2 y **0 de 20** con
+6.1, sin ninguna resincronización espuria; `live_input_test` 22/22 y `replay_test` 28/28 en ambos.
+
+Con eso, WHIP nativo (ruta B) ya no está descartado. La ruta A sigue siendo la recomendada porque no
+obliga a compilar y llevar un FFmpeg propio.
 
 ## 4. GStreamer
 
