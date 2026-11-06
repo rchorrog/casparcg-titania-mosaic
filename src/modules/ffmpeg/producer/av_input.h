@@ -69,6 +69,7 @@ class Input
     void internal_reset();
     void run_read_loop();
     bool is_live() const;
+    void request_abort();
 
     std::atomic<int64_t> reconnects_{0};
     std::atomic<bool>    discontinuity_{false};

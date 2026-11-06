@@ -174,8 +174,7 @@ Input::~Input()
     // `graph_` is NOT reset here any more (upstream #1748): the read thread calls
     // graph_->set_value() until it is joined below, and reassigning a shared_ptr another thread
     // is reading is a data race. It is released with the object, after the join.
-    abort_request_ = true;
-    ic_cond_.notify_all();
+    request_abort();
 
     std::shared_ptr<AVPacket> packet;
     while (buffer_.try_pop(packet))
@@ -203,10 +202,21 @@ std::shared_ptr<AVFormatContext> Input::context() const
     return published_;
 }
 
+void Input::request_abort()
+{
+    // The flag goes first: interrupt_cb reads it without the lock, so a read or open that holds the
+    // lock returns promptly. The lock is taken before notifying so that the read thread cannot test
+    // the flag, miss this notification and then wait for good -- which hung the join below.
+    abort_request_ = true;
+    {
+        std::lock_guard<std::mutex> lock(ic_mutex_);
+    }
+    ic_cond_.notify_all();
+}
+
 void Input::abort()
 {
-    abort_request_ = true;
-    ic_cond_.notify_all();
+    request_abort();
 
     std::shared_ptr<AVPacket> packet;
     while (buffer_.try_pop(packet))
