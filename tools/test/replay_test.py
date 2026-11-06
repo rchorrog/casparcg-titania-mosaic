@@ -57,6 +57,7 @@ CONFIG = """<?xml version="1.0" encoding="utf-8"?>
         <channel><video-mode>720p5000</video-mode><consumers/></channel>
         <channel><video-mode>720p5000</video-mode><consumers/></channel>
         <channel><video-mode>720p5000</video-mode><color-depth>16</color-depth><consumers/></channel>
+        <channel><video-mode>1080i5000</video-mode><consumers/></channel>
     </channels>
     <controllers>
         <tcp><port>{port}</port><protocol>AMCP</protocol></tcp>
@@ -249,6 +250,24 @@ class Run:
             time.sleep(0.1)
         raise RuntimeError("el consumer IMAGE no escribio %s" % path)
 
+    def shot(self, channel, name):
+        """Como capture(), pero devuelve la ruta del PNG (para leer la marca)."""
+        path = os.path.join(self.media, name + ".png")
+        if os.path.exists(path):
+            os.remove(path)
+        self.a.ok('ADD %d IMAGE "%s"' % (channel, name))
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                time.sleep(0.3)
+                try:
+                    read_png(path)
+                    return path
+                except Exception:
+                    pass
+            time.sleep(0.1)
+        raise RuntimeError("el consumer IMAGE no escribio %s" % path)
+
     def wait_layer(self, channel, layer, leaf, pred, timeout=10.0):
         deadline = time.time() + timeout
         last = None
@@ -274,6 +293,94 @@ def color_cmd(c):
 
 def segments(media, name):
     return sorted(glob.glob(os.path.join(media, name, name + ".*.rseg")))
+
+
+# ── Clip de marcas: cada frame lleva su numero en binario ───────────────────────────────────
+#
+# Nueve barras verticales, blanca (Y=235) o negra (Y=16): el frame k pinta el bit i en la barra
+# i. 512 valores distintos, legibles tras VMX, tras el escalado a cualquier canal y sin depender
+# de ninguna matriz de color (solo luma). Se escribe en Y4M desde Python para no depender de un
+# ffmpeg en la maquina que prepara la prueba; el servidor lo lee con su propio FFmpeg.
+MARK_BITS = 9
+MARK_FRAMES = 1 << MARK_BITS
+MARK_BAR = 32
+MARK_H = 16
+
+
+def write_marker_clip(path, fps=50):
+    w = MARK_BAR * MARK_BITS
+    chroma = bytes([128]) * (w * MARK_H)
+    with open(path, "wb") as f:
+        f.write(b"YUV4MPEG2 W%d H%d F%d:1 Ip A1:1 C444\n" % (w, MARK_H, fps))
+        for k in range(MARK_FRAMES):
+            row = b"".join(bytes([235 if (k >> i) & 1 else 16]) * MARK_BAR for i in range(MARK_BITS))
+            f.write(b"FRAME\n")
+            f.write(row * MARK_H)
+            f.write(chroma)
+            f.write(chroma)
+
+
+def bars_to_marker(values):
+    """Valores de las nueve barras (0-255) -> numero, o None si alguna barra es ambigua (mezcla
+    de dos frames, o una imagen que no es el clip)."""
+    k = 0
+    for i, v in enumerate(values):
+        if v > 170:
+            k |= 1 << i
+        elif v >= 85:
+            return None
+    return k
+
+
+def read_marker(path):
+    w, h, bpp, rows = read_png(path)
+    row = rows[h // 2]
+    return bars_to_marker([row[int((i + 0.5) * w / MARK_BITS) * bpp] for i in range(MARK_BITS)])
+
+
+def file_markers(ffmpeg, path, width, height):
+    """Marca de cada frame de una grabacion del consumer FILE: la fila central reducida a nueve
+    pixeles (uno por barra), en gris."""
+    p = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-vf",
+                        "crop=%d:2:0:%d,scale=%d:1:flags=area,format=gray" % (width, height // 2 - 1, MARK_BITS),
+                        "-f", "rawvideo", "-"], capture_output=True)
+    raw = p.stdout
+    return [bars_to_marker(raw[i : i + MARK_BITS]) for i in range(0, len(raw) - MARK_BITS + 1, MARK_BITS)]
+
+
+def steps_of(markers):
+    """Pasos entre frames consecutivos, en registros (modulo el clip), ignorando frames ilegibles."""
+    out = []
+    prev = None
+    for m in markers:
+        if m is None:
+            prev = None
+            continue
+        if prev is not None:
+            d = (m - prev) % MARK_FRAMES
+            out.append(d - MARK_FRAMES if d > MARK_FRAMES // 2 else d)
+        prev = m
+    return out
+
+
+def slope(a, channel, layer, secs=2.0, leaf="file/frame"):
+    """Registros por segundo de `leaf`, por minimos cuadrados sobre muestras de INFO. file/frame
+    cuenta desde el registro mas antiguo que queda: con la retencion borrando, usar
+    replay/frame_number, que es absoluto."""
+    pts = []
+    end = time.time() + secs
+    while time.time() < end:
+        f = layer_key(a.info(channel), layer, leaf)
+        if f is not None:
+            pts.append((time.time(), float(f)))
+        time.sleep(0.1)
+    if len(pts) < 5:
+        return None
+    n = len(pts)
+    mt = sum(t for t, _ in pts) / n
+    mf = sum(f for _, f in pts) / n
+    den = sum((t - mt) ** 2 for t, _ in pts)
+    return sum((t - mt) * (f - mf) for t, f in pts) / den if den else None
 
 
 def run_tests(r, ffprobe):
@@ -456,6 +563,216 @@ def run_tests(r, ffprobe):
     a.ok('REMOVE 2 REPLAY "keep2"')
 
 
+def run_transport_tests(r, ffmpeg):
+    """Transporte leido de la IMAGEN: seek exacto, velocidades frame a frame, IN/OUT/LOOP, los
+    extremos sin LOOP, un canal entrelazado, la retencion bajo un lector y la regrabacion con el
+    mismo nombre. Cada frame grabado lleva su numero (clip de marcas), asi que el registro que se
+    ve se lee de la imagen, no de lo que el servidor publica."""
+    a = r.a
+    media = r.media
+    if not ffmpeg:
+        # Sin ffmpeg no se pueden leer las grabaciones del consumer FILE: es un fallo, no un salto.
+        r.check("transporte: ffmpeg disponible para leer las grabaciones frame a frame", False,
+                "instala ffmpeg o pasa --ffmpeg")
+        return
+    write_marker_clip(os.path.join(media, "marks.y4m"))
+
+    # Consumers permanentes: sin ellos un canal no mezcla en 2.5.0 y las capturas llegan viejas.
+    a.ok('ADD 1 REPLAY "keep1t?segment=2&max_duration=4"')
+    a.ok('ADD 2 REPLAY "keep2t?segment=2&max_duration=4"')
+    a.ok('ADD 4 REPLAY "keep4t?segment=2&max_duration=4"')
+
+    # ── 9. Grabacion de un clip con marcas: ~7 s, menos de 512 registros (sin ambiguedad) ──
+    a.ok('PLAY 1-10 "marks.y4m" LOOP')
+    time.sleep(1.0)
+    s1 = read_marker(r.shot(1, "src_a"))
+    s2 = read_marker(r.shot(1, "src_b"))
+    r.check("el clip de marcas se reproduce en el canal fuente (marca legible y avanzando)",
+            s1 is not None and s2 is not None and s1 != s2, "marcas %s, %s" % (s1, s2))
+    a.ok('ADD 1 REPLAY "tm?segment=2&max_duration=60"')
+    time.sleep(7.0)
+    a.ok('REMOVE 1 REPLAY "tm"')
+    time.sleep(1.0)
+
+    a.ok('PLAY 2-10 "tm" SPEED 0')
+    time.sleep(0.8)
+    n = int(float(layer_key(a.info(2), 10, "file/length")))
+    m0 = read_marker(r.shot(2, "tm_play0"))
+    r.check("PLAY ... SPEED 0 sin SEEK muestra el registro 0 (marca legible)", m0 is not None and 300 <= n < 512,
+            "marca=%s, file/length=%d" % (m0, n))
+    if m0 is None:
+        return
+
+    def rec_of(m):
+        return None if m is None else (m - m0) % MARK_FRAMES
+
+    # Seek exacto en pausa, los dos extremos incluidos: el registro N lleva la marca m0+N. Esto
+    # comprueba a la vez que la grabacion no salto ni repitio frames (un hueco desplaza todo lo
+    # que viene detras) y que SEEK cae en el registro pedido.
+    got = []
+    for k in (1, 2, 137, n // 2, n - 2, n - 1):
+        a.ok("CALL 2-10 SEEK %d" % k)
+        time.sleep(0.5)
+        got.append((k, rec_of(read_marker(r.shot(2, "tm_seek_%d" % k)))))
+    r.check("SEEK N en pausa muestra el registro N, extremos incluidos (grabacion sin huecos)",
+            all(k == v for k, v in got), "pedido -> mostrado: %s" % got)
+
+    # ── 10. Velocidades, frame a frame: se graba la salida y se lee la marca de cada frame ──
+    def run_at(speed, start, tag, secs=2.5):
+        a.ok("CALL 2-10 SPEED 0")
+        a.ok("CALL 2-10 SEEK %d" % start)
+        time.sleep(0.4)
+        out = os.path.join(media, tag + ".mkv")
+        if os.path.exists(out):
+            os.remove(out)
+        # Sin audio: solo se leen las marcas, y con FFmpeg 8 el audio por defecto del contenedor
+        # rechaza la disposicion de 16 canales del canal.
+        a.ok('ADD 2 FILE "%s.mkv" -codec:v libx264 -preset:v ultrafast -crf:v 10 -an' % tag)
+        time.sleep(0.3)
+        a.ok("CALL 2-10 SPEED %s" % speed)
+        rate = slope(a, 2, 10, secs)
+        a.ok('REMOVE 2 FILE "%s.mkv"' % tag)
+        time.sleep(1.5)
+        steps = steps_of(file_markers(ffmpeg, out, 1280, 720))
+        return rate, steps
+
+    for speed, start, want_steps, want_rate in (
+            ("1", 30, {1}, 50.0),
+            ("2", 30, {2}, 100.0),
+            ("-1", n - 40, {-1}, -50.0),
+            ("0.5", 30, {0, 1}, 25.0)):
+        rate, steps = run_at(speed, start, "sp_%s" % speed.replace("-", "m").replace(".", "_"))
+        # Fuera la pausa de antes y de despues (pasos 0 en los extremos); dentro, un 0 a velocidad 1
+        # es un frame repetido y cuenta como fallo.
+        while steps and steps[0] == 0:
+            steps.pop(0)
+        while steps and steps[-1] == 0:
+            steps.pop()
+        core = steps[5:-5] if len(steps) > 20 else steps
+        exact = bool(core) and all(s in want_steps for s in core)
+        if speed == "0.5":
+            ones = sum(1 for s in core if s == 1)
+            exact = exact and bool(core) and abs(ones / len(core) - 0.5) <= 0.1
+        r.check("SPEED %s: cada frame avanza %s registro(s), leido de la imagen" % (speed, sorted(want_steps)),
+                exact, "%d pasos, distintos: %s" % (len(core), sorted(set(core))[:8]))
+        r.check("SPEED %s: file/frame avanza a %.0f registros/s" % (speed, want_rate),
+                rate is not None and abs(rate - want_rate) <= abs(want_rate) * 0.1,
+                "medido %s" % (None if rate is None else "%.1f" % rate))
+
+    # ── 11. IN/OUT con LOOP: se queda en el rango y da la vuelta ──
+    a.ok('PLAY 2-10 "tm" LOOP IN 100 OUT 150 SEEK 100 SPEED 1')
+    frames = []
+    end = time.time() + 3.0
+    while time.time() < end:
+        f = layer_key(a.info(2), 10, "file/frame")
+        if f is not None:
+            frames.append(int(float(f)))
+        time.sleep(0.05)
+    wraps = sum(1 for x, y in zip(frames, frames[1:]) if y < x)
+    r.check("LOOP IN 100 OUT 150: file/frame no sale de [100, 150) y da la vuelta",
+            frames and min(frames) >= 100 and max(frames) <= 149 and wraps >= 2,
+            "min %s max %s, vueltas %d" % (min(frames or [0]), max(frames or [0]), wraps))
+    m = rec_of(read_marker(r.shot(2, "tm_loop")))
+    r.check("LOOP: la imagen es un registro del rango", m is not None and 100 <= m <= 149, "registro %s" % m)
+
+    # ── 12. Sin LOOP: hacia delante se para en OUT-1, hacia atras en IN, sin negro ──
+    a.ok('PLAY 2-10 "tm" IN 100 OUT 150 SEEK 140 SPEED 1')
+    time.sleep(1.5)
+    i2 = a.info(2)
+    fr, at_end = layer_key(i2, 10, "file/frame"), layer_key(i2, 10, "replay/at_end")
+    m1 = rec_of(read_marker(r.shot(2, "tm_end_a")))
+    time.sleep(0.5)
+    m2 = rec_of(read_marker(r.shot(2, "tm_end_b")))
+    r.check("sin LOOP se para en OUT-1 (registro 149) y lo mantiene en pantalla",
+            fr is not None and int(float(fr)) == 149 and m1 == 149 and m2 == 149,
+            "file/frame=%s, imagen %s y %s" % (fr, m1, m2))
+    r.check("replay/at_end se publica al llegar al final", at_end in ("true", "1"), "replay/at_end=%s" % at_end)
+
+    a.ok('PLAY 2-10 "tm" IN 100 OUT 150 SEEK 110 SPEED -1')
+    time.sleep(1.0)
+    fr = layer_key(a.info(2), 10, "file/frame")
+    m = rec_of(read_marker(r.shot(2, "tm_rev_end")))
+    r.check("hacia atras sin LOOP se para en IN (registro 100)",
+            fr is not None and int(float(fr)) == 100 and m == 100, "file/frame=%s, imagen %s" % (fr, m))
+
+    # ── 13. Avance rapido dentro de una grabacion que crece: vuelve a velocidad 1 al alcanzarla ──
+    a.ok('ADD 1 REPLAY "tg?segment=2&max_duration=60"')
+    time.sleep(3.0)
+    a.ok('PLAY 2-10 "tg" SEEK 0 SPEED 4')
+    time.sleep(3.0)
+    rate = slope(a, 2, 10, 2.0)
+    i2 = a.info(2)
+    ln, fr = layer_key(i2, 10, "file/length"), layer_key(i2, 10, "file/frame")
+    gap = None if ln is None or fr is None else int(float(ln)) - 1 - int(float(fr))
+    r.check("SPEED 4 al alcanzar el final de una grabacion en curso sigue a velocidad 1, pegado a ella",
+            rate is not None and abs(rate - 50) <= 5 and gap is not None and 0 <= gap <= 5,
+            "ritmo %s registros/s, distancia a la cabeza %s" % (None if rate is None else "%.1f" % rate, gap))
+    a.ok('REMOVE 1 REPLAY "tg"')
+
+    # ── 14. Canal entrelazado (1080i50): un registro por campo, y se reproduce limpio ──
+    a.ok('PLAY 4-10 "marks.y4m" LOOP')
+    time.sleep(1.0)
+    a.ok('ADD 4 REPLAY "ti?segment=2&max_duration=60"')
+    time.sleep(3.0)
+    w1 = port_key(a.info(4), "replay/frames_written", "ti")
+    t1 = time.time()
+    time.sleep(3.0)
+    w2 = port_key(a.info(4), "replay/frames_written", "ti")
+    per_s = None if w1 is None or w2 is None else (float(w2) - float(w1)) / (time.time() - t1)
+    r.check("1080i50 graba un registro por campo, ~50/s (como en CasparVP)",
+            per_s is not None and 45 <= per_s <= 55, "%s registros/s" % (None if per_s is None else "%.1f" % per_s))
+    a.ok('REMOVE 4 REPLAY "ti"')
+    time.sleep(1.0)
+    a.ok('PLAY 4-20 "ti" SEEK 20 SPEED 0')
+    time.sleep(1.0)
+    mi = read_marker(r.shot(4, "ti_paused"))
+    r.check("1080i50: un registro en pausa se ve limpio (marca legible, sin mezcla de dos frames)", mi is not None,
+            "marca %s" % mi)
+    a.ok("CALL 4-20 SPEED 1")
+    rate = slope(a, 4, 20, 2.0)
+    r.check("1080i50: SPEED 1 reproduce ~50 registros/s, uno por campo",
+            rate is not None and abs(rate - 50) <= 5, "medido %s" % (None if rate is None else "%.1f" % rate))
+    a.ok("STOP 4-20")
+    a.ok("STOP 4-10")
+
+    # ── 15. Retencion bajo un lector parado en el registro 0 ──
+    a.ok('ADD 1 REPLAY "tr?segment=1&max_duration=3"')
+    time.sleep(2.5)
+    a.ok('PLAY 2-10 "tr" SEEK 0 SPEED 0')
+    time.sleep(7.0)  # el segmento del registro 0 se borra mientras el lector lo tiene
+    alive = True
+    try:
+        a.cmd("VERSION")
+    except Exception:
+        alive = False
+    a.ok("CALL 2-10 SPEED 1")
+    rate = slope(a, 2, 10, 2.0, leaf="replay/frame_number") if alive else None
+    mr = read_marker(r.shot(2, "tr_after")) if alive else None
+    r.check("la retencion borra bajo un lector parado y la reproduccion sigue (servidor vivo, imagen legible)",
+            alive and rate is not None and rate > 40 and mr is not None,
+            "vivo=%s, ritmo %s, marca %s" % (alive, None if rate is None else "%.1f" % rate, mr))
+    a.ok('REMOVE 1 REPLAY "tr"')
+
+    # ── 16. Regrabar con un nombre existente no toca la grabacion anterior ──
+    before = [(p, os.path.getsize(p)) for p in segments(media, "tm")]
+    a.ok('ADD 1 REPLAY "tm?segment=2&max_duration=60"')
+    time.sleep(2.5)
+    a.ok('REMOVE 1 REPLAY "tm"')
+    time.sleep(1.0)
+    after = [(p, os.path.getsize(p)) for p in segments(media, "tm")]
+    renamed = [d for d in glob.glob(os.path.join(media, "tm_*")) if os.path.isdir(d)]
+    r.check("regrabar con el mismo nombre deja la primera intacta y graba la segunda aparte",
+            before and before == after and len(renamed) == 1,
+            "%d segmentos antes y %d despues, carpetas nuevas %s" % (len(before), len(after),
+                                                                     [os.path.basename(d) for d in renamed]))
+
+    a.ok("STOP 2-10")
+    a.ok("STOP 1-10")
+    a.ok('REMOVE 1 REPLAY "keep1t"')
+    a.ok('REMOVE 2 REPLAY "keep2t"')
+    a.ok('REMOVE 4 REPLAY "keep4t"')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", help="ejecutable de CasparCG a arrancar (si se omite, se usa uno ya arrancado)")
@@ -465,6 +782,7 @@ def main():
     ap.add_argument("--workdir", help="carpeta para config, media y logs (por defecto, temporal)")
     ap.add_argument("--keep", action="store_true", help="no borrar la carpeta de trabajo")
     ap.add_argument("--ffprobe", default=shutil.which("ffprobe"))
+    ap.add_argument("--ffmpeg", default=shutil.which("ffmpeg"))
     args = ap.parse_args()
 
     proc = None
@@ -508,6 +826,7 @@ def main():
     else:
         try:
             run_tests(r, args.ffprobe)
+            run_transport_tests(r, args.ffmpeg)
         except Exception as e:  # una excepcion es un fallo, nunca una prueba saltada
             traceback.print_exc()
             failed_to_run = "%s: %s (ultimo comando: %s)" % (type(e).__name__, e, getattr(amcp, "last", "?"))

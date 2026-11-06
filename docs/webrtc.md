@@ -84,7 +84,7 @@ Ahora el decodificador solo deja pasar una línea de tiempo de confianza: un fra
 esperada se retiene; si la línea anterior continúa, se descarta; si tres frames seguidos confirman
 la nueva, el salto es real y se acepta. Un frame sin marca toma la esperada, o se descarta mientras
 un salto está sin confirmar. Medido: **0 de 40** congelaciones con FFmpeg 8.1.2 y **0 de 20** con
-6.1, sin ninguna resincronización espuria; `live_input_test` 22/22 y `replay_test` 28/28 en ambos.
+6.1, sin ninguna resincronización espuria; `live_input_test` 22/22 y `replay_test` 50/50 en ambos.
 
 Con eso, WHIP nativo (ruta B) ya no está descartado. La ruta A sigue siendo la recomendada porque no
 obliga a compilar y llevar un FFmpeg propio.

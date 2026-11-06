@@ -379,10 +379,17 @@ Además, para que el módulo funcione en este árbol se corrigieron dos cosas fu
 ## 10. Prueba
 
 `tools/test/replay_test.py` arranca un servidor con su propia configuración (tres canales 720p50, el
-tercero de 16 bits; puerto AMCP **5290**, para no tocar un servidor de producción en 5250), graba,
-reproduce y comprueba la **imagen** con el consumer `IMAGE`, no solo lo que el servidor publica. Solo
-usa la biblioteca estándar de Python 3; si hay `ffprobe` en el PATH inspecciona también el fichero
+tercero de 16 bits, y un cuarto 1080i50; puerto AMCP **5290**, para no tocar un servidor de
+producción en 5250), graba, reproduce y comprueba la **imagen** con el consumer `IMAGE`, no solo lo
+que el servidor publica. Solo usa la biblioteca estándar de Python 3. Necesita `ffmpeg` en el PATH
+(o `--ffmpeg`) para leer frame a frame las grabaciones del consumer `FILE`; sin él, las
+comprobaciones de transporte cuentan como fallo. Si hay `ffprobe`, inspecciona también el fichero
 exportado.
+
+Las comprobaciones de transporte graban un **clip de marcas**: nueve barras blancas o negras que
+llevan en binario el número de cada frame (512 valores), generado en Y4M por la propia prueba. El
+registro que se ve se lee de la imagen, así que un seek que cae un registro más allá, o una
+velocidad que repite o salta un frame, se ven aunque el servidor publique el número correcto.
 
 ```bash
 # Linux
@@ -407,16 +414,26 @@ como fallo.
 | la retención borra (`segment=2`, `max_duration=6`), y la línea de tiempo del reproductor no supera lo que hay en disco | más de 5 segmentos, o una longitud mayor que (6 + 4) s × 50 |
 | un canal de 16 bits graba `vmx-p216`, y un gris se reproduce idéntico y neutro (diferencia entre canales ≤ 1 LSB) | sin el reescalado de §9, 2 LSB de dominante: **verificado con una mutación**, falla |
 | `REMOVE` de una segunda grabación la quita y deja la primera grabando | |
+| `SEEK N` en pausa muestra el registro N, los dos extremos incluidos (marca m0+N) | un seek que cae un registro más allá, o una grabación con un hueco o un frame repetido, que desplaza todo lo que viene detrás |
+| a `SPEED 1`, `2`, `-1` y `0.5`, **cada frame** de la salida avanza 1, 2, −1, y 0/1 alternos (≈ 115 frames por velocidad, grabados con `FILE`), y `file/frame` avanza a 50, 100, −50 y 25 registros/s (±10 %) | un frame repetido o saltado en cualquier punto del tramo |
+| `LOOP IN 100 OUT 150` no sale de [100, 150) y da la vuelta; la imagen es un registro del rango | |
+| sin `LOOP`, hacia delante se para y se queda en `OUT−1` (con `replay/at_end`), hacia atrás en `IN`, sin negro | |
+| `SPEED 4` hacia el final de una grabación en curso vuelve a velocidad 1 pegado a la cabeza | |
+| un canal 1080i50 graba un registro por campo (50/s, como en CasparVP), lo muestra limpio en pausa y lo reproduce a 50/s | |
+| la retención borra el segmento de un lector parado en el registro 0, y al reanudar el servidor sigue vivo y la imagen es legible | |
+| regrabar con un nombre existente deja la primera grabación intacta y graba la segunda con otro nombre | |
 
-**Resultados (2026-11-05): 28/28** en WSL2 Ubuntu 24.04 (GCC 13.3, FFmpeg 6.1, mezclador OpenGL
-sobre el driver D3D12 de Mesa), **28/28** en Windows 10 (MSVC 14.50, Release, FFmpeg 7.0.2) y
-**28/28** en Docker con la imagen de `tools/test/Dockerfile` (Ubuntu 24.04, ejecutada en WSL2 con
-`--device /dev/dxg` y `GALLIUM_DRIVER=d3d12`). Ninguna de las tres con GPU NVIDIA nativa en Linux:
-la variante `--gpus all` del Dockerfile no se ha ejecutado.
+**Resultados (2026-11-06): 50/50** en WSL2 Ubuntu 24.04 con FFmpeg 6.1 y con FFmpeg 8.1.2 (GCC 13.3,
+mezclador OpenGL sobre el driver D3D12 de Mesa). Las 28 comprobaciones anteriores pasaron también
+(2026-11-05) en Windows 10 (MSVC 14.50, Release, FFmpeg 7.0.2) y en Docker con la imagen de
+`tools/test/Dockerfile` (Ubuntu 24.04, en WSL2 con `--device /dev/dxg` y `GALLIUM_DRIVER=d3d12`);
+las 22 nuevas no se han ejecutado aún en esos dos. Ninguna con GPU NVIDIA nativa en Linux: la
+variante `--gpus all` del Dockerfile no se ha ejecutado.
 
 **Lo que no cubre:** varios reproductores a la vez y el coste a 1080p50/2160p; la recuperación de una
 grabación tras matar el servidor (el lado del lector se cubre en el fork, el del escritor en
-ninguno); el borrado de un segmento que un lector tiene abierto; el modo entrelazado; el formato
-antiguo `.mav`; y la salida por una tarjeta real (todas las capturas son del consumer `IMAGE`). En
+ninguno); el audio a velocidad 1 (que se oye) y a otras velocidades (que calla); el formato
+antiguo `.mav`; y la salida por una tarjeta real (todas las capturas son del consumer `IMAGE` o
+`FILE`). En
 WSL hay que usar `GALLIUM_DRIVER=d3d12`: con llvmpipe, el primer draw del mezclador se queda
 compilando el shader y el canal no avanza.
