@@ -141,14 +141,29 @@ void Input::run_read_loop()
                 break;
             }
 
-            try {
-                std::unique_lock<std::mutex> lock(ic_mutex_);
-                eof_ = false;
-                internal_reset();
-                was_reopened = true;
-            } catch (...) {
-                // Still down. Stay in the loop and try again after a longer backoff; do not
-                // log again here, the counter above already tells the story.
+            // Se suelta primero la conexión vieja: una entrada UDP unicast no puede volver a
+            // enlazar su puerto mientras el socket viejo lo tiene ("bind failed: Address already
+            // in use"), así que tras un desbordamiento del búfer UDP cada reapertura fallaba y el
+            // tile quedaba congelado para siempre. El contexto sigue vivo para los decodificadores
+            // que lo retienen, pero ya no se lee de él: si la reapertura falla se reintenta aquí,
+            // sin volver a av_read_frame sobre un contexto sin `pb`.
+            std::unique_lock<std::mutex> lock(ic_mutex_);
+            if (ic_ && ic_->pb && !(ic_->iformat->flags & AVFMT_NOFILE)) {
+                avio_closep(&ic_->pb);
+            }
+            while (!abort_request_) {
+                try {
+                    eof_ = false;
+                    internal_reset();
+                    was_reopened = true;
+                    break;
+                } catch (...) {
+                    // Sigue caída. Sin log aquí: el contador de arriba ya lo cuenta.
+                    backoff_ms = std::min(backoff_ms * 2, 5000);
+                    lock.unlock();
+                    boost::this_thread::sleep_for(boost::chrono::milliseconds(backoff_ms));
+                    lock.lock();
+                }
             }
         }
     }
