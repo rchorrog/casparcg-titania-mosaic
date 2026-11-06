@@ -157,8 +157,7 @@ void Input::run_read_loop()
 Input::~Input()
 {
     graph_         = spl::shared_ptr<diagnostics::graph>();
-    abort_request_ = true;
-    ic_cond_.notify_all();
+    request_abort();
 
     std::shared_ptr<AVPacket> packet;
     while (buffer_.try_pop(packet))
@@ -183,10 +182,21 @@ bool Input::try_pop(std::shared_ptr<AVPacket>& packet)
 AVFormatContext*       Input::operator->() { return ic_.get(); }
 AVFormatContext* const Input::operator->() const { return ic_.get(); }
 
+void Input::request_abort()
+{
+    // The flag goes first: interrupt_cb reads it without the lock, so a read or open that holds the
+    // lock returns promptly. The lock is taken before notifying so that the read thread cannot test
+    // the flag, miss this notification and then wait for good -- which hung the join below.
+    abort_request_ = true;
+    {
+        std::lock_guard<std::mutex> lock(ic_mutex_);
+    }
+    ic_cond_.notify_all();
+}
+
 void Input::abort()
 {
-    abort_request_ = true;
-    ic_cond_.notify_all();
+    request_abort();
 
     std::shared_ptr<AVPacket> packet;
     while (buffer_.try_pop(packet))
