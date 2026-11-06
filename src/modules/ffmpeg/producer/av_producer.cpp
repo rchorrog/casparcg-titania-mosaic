@@ -175,6 +175,7 @@ class Decoder
     // confirmed, with their durations; where the next of them is expected; and latched counters.
     std::vector<std::pair<std::shared_ptr<AVFrame>, int64_t>> held;
     int64_t                                                   held_next        = AV_NOPTS_VALUE;
+    int64_t                                                   held_start       = AV_NOPTS_VALUE;
     int64_t                                                   nopts_filled     = 0;
     int64_t                                                   nopts_dropped    = 0;
     int64_t                                                   outliers_dropped = 0;
@@ -367,9 +368,9 @@ class Decoder
                             // which FFmpeg 8's decoder made frequent (5 of 37 runs) and 6.1's rare.
                             //
                             // So: a frame more than five seconds off the expected timeline is HELD.
-                            // If the old timeline resumes, it was an outlier and is dropped. If three
-                            // frames in a row agree on the new one, the jump is real (encoder
-                            // restart, wrap) and is confirmed at its first frame. A frame with no
+                            // If the old timeline resumes, it was an outlier and is dropped. If the
+                            // new one holds for a second, the jump is real (encoder restart, wrap)
+                            // and is confirmed at the first frame still held. A frame with no
                             // timestamp takes the expected one -- only from the trusted timeline,
                             // never while a jump is unconfirmed, when it is dropped instead.
                             const auto threshold = av_rescale_q(5 * AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
@@ -409,9 +410,21 @@ class Decoder
                                 accept(std::move(av_frame), duration_pts);
                             } else if (!held.empty() && held_next != AV_NOPTS_VALUE &&
                                        std::abs(av_frame->pts - held_next) <= threshold) {
-                                held_next = duration_pts > 0 ? av_frame->pts + duration_pts : AV_NOPTS_VALUE;
+                                // Confirmed only once the new timeline has held for a second: ONE
+                                // damaged PES timestamp is enough to produce three or more frames
+                                // that agree with each other. "Three in a row" accepted such false
+                                // jumps and left the layer waiting for frames, about one corrupt-
+                                // input test in ten. Only the last three are kept, so a layer does
+                                // not hold a second of decoded video.
+                                const auto one_second = av_rescale_q(AV_TIME_BASE, {1, AV_TIME_BASE}, st->time_base);
+                                const auto pts        = av_frame->pts;
+                                held_next = duration_pts > 0 ? pts + duration_pts : AV_NOPTS_VALUE;
                                 held.emplace_back(std::move(av_frame), duration_pts);
-                                if (held.size() >= 3) {
+                                if (held.size() > 3) {
+                                    held.erase(held.begin());
+                                    outliers_dropped += 1;
+                                }
+                                if (pts - held_start >= one_second) {
                                     // Confirmed: the stream really moved. Downstream resyncs at the
                                     // first frame of the new timeline (see run()).
                                     discontinuity_time = av_rescale_q(held.front().first->pts, st->time_base, TIME_BASE_Q);
@@ -427,7 +440,8 @@ class Decoder
                                     log_latched(outliers_dropped, "dropped frames whose timestamps were far off the stream's");
                                 }
                                 held.clear();
-                                held_next = duration_pts > 0 ? av_frame->pts + duration_pts : AV_NOPTS_VALUE;
+                                held_start = av_frame->pts;
+                                held_next  = duration_pts > 0 ? av_frame->pts + duration_pts : AV_NOPTS_VALUE;
                                 held.emplace_back(std::move(av_frame), duration_pts);
                             }
                             continue;
