@@ -604,6 +604,12 @@ fase3_sistema() {
     netcat-openbsd patchelf bc jq
   ok "Dependencias de compilación instaladas."
 
+  # ffmpeg en el HOST (no solo en los dockers): teletext-bridge.js lanza un ffmpeg por página
+  # de subtítulos. Sin él, el servicio arranca sin error y los subtítulos no salen nunca
+  # (pasó en mosaic5, 11/11/2026).
+  sudo apt-get install -y --no-install-recommends ffmpeg
+  ok "ffmpeg $(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f3) instalado (teletext-bridge)."
+
   # Node.js 20 LTS
   if ! command -v node &>/dev/null || ! node --version | grep -q "^v20"; then
     info "Instalando Node.js 20 LTS..."
@@ -1212,6 +1218,10 @@ check_sistema() {
   chk "CasparCG escucha en 5250"                   nc -z localhost 5250
   chk "osc-bridge responde en :6253"               curl -sf http://localhost:6253/ -o /dev/null
   chk "teletext-bridge habilitado"                 systemctl is-enabled teletext-bridge
+  chk "ffmpeg en el host (teletext-bridge)"        command -v ffmpeg
+  # ws: teletext-bridge lo busca en el sistema y, si no está, en vumeter/node_modules (va en el
+  # repo mosaic con las plantillas). node-ws de apt no vale: con el Node de nodesource no se ve.
+  chk "teletext-bridge encuentra el módulo ws"     bash -c "cd '${MOSAIC_DIR}/templates/teletext' && node -e \"try{require('ws')}catch(e){require('../vumeter/node_modules/ws')}\""
   chk "Directorio templates existe"                test -d "${MOSAIC_DIR}/templates"
 
   echo ""
