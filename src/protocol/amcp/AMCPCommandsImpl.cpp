@@ -60,6 +60,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <future>
 #include <memory>
@@ -473,14 +474,19 @@ std::wstring relink_signal_command(command_context& ctx)
                    L"RELINK_SIGNAL: sync/source-time o file/origin_start_time no disponibles todavia en una de las dos capas"));
     }
 
-    const double diff_seconds = *abs1 - *abs2;
+    // El PTS de MPEG-TS es de 33 bits a 90 kHz y da la vuelta cada 2^33 / 90000 s (~26,5 h). Cada
+    // docker de entrada lo desenrolla por su cuenta desde su arranque (-copyts), asi que si Main y
+    // Backup arrancaron a distinto lado de una vuelta su PTS absoluto difiere en un multiplo exacto
+    // de ese periodo mas el desfase real. Visto en mosaic2 del 01 al 05/11/2026: cientos de
+    // rechazos al dia con 1, 2, 3 y 6 vueltas, y una de ellas con 4,24 s de desfase real que nunca
+    // se corrigio. Se reduce al intervalo (-periodo/2, periodo/2].
+    const double PTS_WRAP_S   = 8589934592.0 / 90000.0;
+    const double diff_seconds = std::remainder(*abs1 - *abs2, PTS_WRAP_S);
 
     // Por debajo de un frame no hay nada que corregir: PAUSE trabaja en frames enteros.
     const double MIN_CORRECTABLE_S = 0.04;
-    // Techo de cordura. El PTS de MPEG-TS es de 33 bits a 90 kHz, asi que da la vuelta cada
-    // ~95443 s (26,5 h): si una de las dos capas ya ha pasado por el wrap y la otra no, la resta
-    // da un disparate. Sin este limite el comando pausaria una senal durante horas. Tambien
-    // protege del caso de dos capas que no son pareja real (contenidos distintos).
+    // Techo de cordura: sin este limite el comando pausaria una senal durante minutos. Protege del
+    // caso de dos capas que no son pareja real (contenidos o codificadores distintos).
     const double MAX_CORRECTABLE_S = 10.0;
 
     if (std::abs(diff_seconds) < MIN_CORRECTABLE_S) {
@@ -491,7 +497,7 @@ std::wstring relink_signal_command(command_context& ctx)
         CASPAR_THROW_EXCEPTION(caspar_exception()
                                 << msg_info(L"RELINK_SIGNAL: desfase de " + std::to_wstring(diff_seconds) +
                                             L" s fuera de rango (maximo " + std::to_wstring(MAX_CORRECTABLE_S) +
-                                            L" s). Wrap de PTS, o las dos capas no son pareja."));
+                                            L" s). Las dos capas no son pareja, o el retraso de una no se corrige con una pausa."));
     }
 
     const bool                              first_is_ahead = diff_seconds > 0;
