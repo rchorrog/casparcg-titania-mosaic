@@ -409,10 +409,14 @@ def run_tests(r, ffprobe):
     man = os.path.join(media, "t8", "t8.rman.json")
     r.check("la grabacion crea su manifiesto", os.path.exists(man), man)
     try:
-        codec = json.load(open(man)).get("codec") if os.path.exists(man) else None
+        manifest = json.load(open(man)) if os.path.exists(man) else {}
     except Exception as e:
-        codec = "ilegible: %s" % e
+        manifest = {"codec": "ilegible: %s" % e}
+    codec = manifest.get("codec")
     r.check("canal de 8 bits graba vmx-bgra8", codec == "vmx-bgra8", "codec=%s" % codec)
+    asked = (manifest.get("source_channel"), manifest.get("max_duration"), manifest.get("segment_duration"))
+    r.check("el manifiesto guarda canal de origen, retencion y segmento", asked == (1, 6, 2),
+            "source_channel, max_duration, segment_duration = %s" % (asked,))
     segs = segments(media, "t8")
     r.check("la grabacion escribe segmentos .rseg", len(segs) >= 2, "%d segmentos" % len(segs))
 
@@ -519,6 +523,25 @@ def run_tests(r, ffprobe):
     r.check("la linea de tiempo no supera lo que hay en disco", ln is not None and float(ln) <= (6 + 4) * 50,
             "file/length=%s, maximo %d" % (ln, (6 + 4) * 50))
 
+    # ── 6b. Material protegido: un .protect.json para la retencion; borrarlo la reanuda ──
+    protect = os.path.join(media, "t8", "t8.protect.json")
+    with open(protect + ".tmp", "w") as f:  # todo lo grabado hasta ahora
+        json.dump({"ranges": [{"from_us": 0, "to_us": int(time.time() * 1e6)}]}, f)
+    os.replace(protect + ".tmp", protect)
+    time.sleep(6.0)
+    held = len(segments(media, "t8"))
+    hold = port_key(a.info(1), "replay/protected_hold", "t8")
+    r.check("con material protegido la retencion se para y la grabacion crece",
+            held > 5 and hold is not None and int(float(hold)) > 0,
+            "%d segmentos, replay/protected_hold=%s" % (held, hold))
+    os.remove(protect)
+    time.sleep(3.0)
+    after = len(segments(media, "t8"))
+    hold = port_key(a.info(1), "replay/protected_hold", "t8")
+    r.check("al borrar el .protect.json la retencion recupera su tamano",
+            after <= 5 and hold is not None and int(float(hold)) == 0,
+            "%d segmentos, replay/protected_hold=%s" % (after, hold))
+
     # ── 7. Canal de 16 bits: graba vmx-p216 y se reproduce sin dominante de color ──
     a.ok('ADD 3 REPLAY "t16?segment=2&max_duration=6"')
     time.sleep(2.5)
@@ -617,6 +640,30 @@ def run_transport_tests(r, ffmpeg):
     r.check("SEEK N en pausa muestra el registro N, extremos incluidos (grabacion sin huecos)",
             all(k == v for k, v in got), "pedido -> mostrado: %s" % got)
 
+    # STEP (el jog), leido de la imagen: pasos sueltos, una rafaga que se suma entera, el recorte a
+    # lo grabado, y la capa queda en pausa (replay/speed 0).
+    a.ok("CALL 2-10 SEEK 100")
+    time.sleep(0.4)
+    steps = []
+    for k, want in ((5, 105), (-3, 102)):
+        a.ok("CALL 2-10 STEP %d" % k)
+        time.sleep(0.4)
+        steps.append((k, want, rec_of(read_marker(r.shot(2, "tm_step_%d" % k)))))
+    for _ in range(10):
+        a.ok("CALL 2-10 STEP 1")
+    time.sleep(0.4)
+    steps.append(("10x1", 112, rec_of(read_marker(r.shot(2, "tm_step_burst")))))
+    a.ok("CALL 2-10 STEP -100000")
+    time.sleep(0.4)
+    steps.append((-100000, 0, rec_of(read_marker(r.shot(2, "tm_step_clamp")))))
+    r.check("STEP mueve N registros desde el pedido, suma rafagas y recorta a lo grabado",
+            all(want == got_ for _, want, got_ in steps), "(paso, esperado, mostrado): %s" % steps)
+    speed = layer_key(a.info(2), 10, "replay/speed")
+    r.check("STEP deja la capa en pausa (replay/speed 0)", speed is not None and float(speed) == 0,
+            "replay/speed=%s" % speed)
+    code, _, head = a.cmd("CALL 2-10 STEP x")
+    r.check("CALL STEP x se rechaza (4xx)", 400 <= code < 500, head)
+
     # ── 10. Velocidades, frame a frame: se graba la salida y se lee la marca de cada frame ──
     def run_at(speed, start, tag, secs=2.5):
         a.ok("CALL 2-10 SPEED 0")
@@ -672,6 +719,12 @@ def run_transport_tests(r, ffmpeg):
     r.check("LOOP IN 100 OUT 150: file/frame no sale de [100, 150) y da la vuelta",
             frames and min(frames) >= 100 and max(frames) <= 149 and wraps >= 2,
             "min %s max %s, vueltas %d" % (min(frames or [0]), max(frames or [0]), wraps))
+    i2 = a.info(2)
+    pub = tuple(layer_key(i2, 10, k) for k in ("replay/in", "replay/out", "replay/loop", "replay/speed"))
+    r.check("se publican replay/in, replay/out, replay/loop y replay/speed",
+            pub[0] is not None and int(float(pub[0])) == 100 and pub[1] is not None and int(float(pub[1])) == 150
+            and pub[2] in ("true", "1") and pub[3] is not None and float(pub[3]) == 1,
+            "in, out, loop, speed = %s" % (pub,))
     m = rec_of(read_marker(r.shot(2, "tm_loop")))
     r.check("LOOP: la imagen es un registro del rango", m is not None and 100 <= m <= 149, "registro %s" % m)
 

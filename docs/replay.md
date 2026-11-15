@@ -69,7 +69,9 @@ El perfil de calidad (`LQ` … `OMT_HQ`, §2) se aplica a ambos.
 ```
 media/
   mi_grabacion/
-    mi_grabacion.rman.json        manifiesto: versión, códec, tamaño, cadencia, campos, profundidad, color, audio
+    mi_grabacion.rman.json        manifiesto: versión, códec, tamaño, cadencia, campos, profundidad, color, audio,
+                                  canal de origen, retención y duración de segmento
+    mi_grabacion.protect.json     (opcional, lo escribe un cliente) rangos que la retención no puede borrar, §2
     mi_grabacion.000000.rseg      segmento 0: cabecera de 256 bytes (magic CVPRPL2) y después los registros
     mi_grabacion.000000.ridx      su índice: cabecera de 64 bytes (magic CVPRIX2), 32 bytes por registro
     mi_grabacion.000001.rseg
@@ -138,6 +140,34 @@ La retención borra segmentos completos por delante y conserva en disco al menos
 lectores abren los segmentos permitiendo su borrado, así que un reproductor aparcado en el material
 más antiguo no bloquea la retención: lo que se mueve es el inicio de su línea de tiempo. Si aun así
 un borrado falla, se registra un aviso y la retención lo vuelve a intentar con el siguiente segmento.
+
+El manifiesto guarda también cómo se pidió la grabación, para que un cliente que lista `media/` sepa
+qué tiene delante sin abrirla: `source_channel` (el canal que graba), `max_duration` y
+`segment_duration` (los dos en segundos).
+
+### Material protegido
+
+Un cliente puede impedir que la retención borre material que le interesa (las marcas de un operador)
+escribiendo en la carpeta de la grabación el fichero `<nombre>.protect.json`:
+
+```json
+{"ranges": [{"from_us": 1794747195681742, "to_us": 1794747196681742}]}
+```
+
+Cada rango son horas de reloj en microsegundos desde 1970 (UTC), las mismas que `vmx/timestamp`. Las
+horas, y no las posiciones, porque las posiciones se desplazan cada vez que la retención borra.
+
+* **La retención se para** en el primer segmento que solape con un rango, y la grabación crece por
+  encima de `max_duration` mientras el rango siga en el fichero. Solo puede parar, no saltárselo:
+  los lectores numeran las posiciones desde el registro más antiguo, así que no puede quedar un hueco
+  en medio. Los segmentos anteriores al protegido se siguen borrando con normalidad.
+* **`replay/protected_hold`** (en el consumer) publica cuántos registros se están guardando de más por
+  la protección; `0` cuando no hay ninguna. Es la señal para avisar de que el disco crece.
+* El fichero se lee como mucho una vez por segundo y solo si cambió. Para cambiarlo, escribir otro y
+  renombrarlo encima, de modo que nunca se lea a medias. **Borrarlo** quita toda la protección y la
+  retención recupera su tamaño en el siguiente registro.
+* Un fichero que no se puede interpretar deja **los rangos que había** y lo registra en el log: perder
+  la protección por un error de escritura borraría justo lo que se quería guardar.
 
 ### Perfiles de calidad
 
@@ -243,6 +273,7 @@ siga en disco.
 | `IN <p>`, `OUT <p>` | rango de reproducción; `OUT` es exclusivo, `OUT 0` sigue el final del material |
 | `LOOP 1\|0` | bucle entre IN y OUT. `LOOP` sin argumento **responde** el estado y no cambia nada |
 | `SPEED <v>` | cualquier número finito; `0` pausa, negativo reproduce hacia atrás. Avanzar rápido hasta el final de una grabación en curso vuelve a `1` |
+| `STEP <±n>` | el jog: avanza (`+`) o retrocede (`-`) `n` registros y deja la capa en pausa ahí; sale del modo seguimiento. En pausa cuenta desde el registro ya pedido, así que una ráfaga de pasos más rápida que el canal se suma entera; reproduciendo, desde el que está en el aire. Se recorta a lo grabado, y a IN/OUT si están puestos |
 | `EXPORT …` | §5.1 |
 
 Un valor que no se puede interpretar se rechaza con **`403 CALL FAILED`**, nunca se responde OK; el
@@ -298,6 +329,7 @@ En el consumer (`channel/<n>/output/port/<índice>/`):
 | `replay/error` | vacío, o el motivo del fallo |
 | `replay/codec` | `vmx-bgra8` o `vmx-p216` |
 | `replay/frames_written`, `replay/dropped_frames`, `replay/segments` | contadores (`frames_written` y `dropped_frames` antiguos se mantienen con los mismos valores) |
+| `replay/protected_hold` | registros guardados por encima de la retención por un `.protect.json`; `0` sin protección |
 
 En el producer (`channel/<n>/stage/layer/<l>/foreground/`):
 
@@ -306,6 +338,8 @@ En el producer (`channel/<n>/stage/layer/<l>/foreground/`):
 | `file/frame`, `file/length`, `file/fps`, `file/time` | la posición mostrada, el número de registros, la cadencia de registros, la posición en segundos |
 | `replay/frame_number` | el número de frame guardado en el registro mostrado |
 | `replay/live`, `replay/live_distance`, `replay/at_end` | modo seguimiento y estado de final |
+| `replay/speed`, `replay/loop` | la velocidad pedida (`0` = pausa) y si hay bucle |
+| `replay/in`, `replay/out` | IN y OUT como posiciones, igual que `file/frame`; `out` `0` = sigue el final del material |
 | `replay/decoded_ahead`, `replay/late_decodes` | frames listos por delante; ticks que tuvieron que decodificar de forma síncrona |
 | `replay/bad_records` | registros rechazados por su CRC |
 | `replay/codec`, `replay/legacy` | el códec de la grabación; si es anterior a v2 |
@@ -411,17 +445,24 @@ como fallo.
 | `CALL BANANA`, `CALL SPEED banana`, `CALL SEEK banana`, `PLAY ... SPEED x` se rechazan con 4xx | OK, un 5xx, o ninguna respuesta |
 | `LIVE 3` se mantiene a 3 registros de la cabeza mientras la grabación crece | otra distancia en cualquiera de seis muestras |
 | `EXPORT` de 250 registros: `done`, ProRes con 250 frames a `50/1`, pista PCM; un segundo `EXPORT` mientras corre se rechaza | `ffprobe` sobre el fichero |
+| el manifiesto guarda `source_channel`, `max_duration` y `segment_duration` | otros valores, o faltan |
 | la retención borra (`segment=2`, `max_duration=6`), y la línea de tiempo del reproductor no supera lo que hay en disco | más de 5 segmentos, o una longitud mayor que (6 + 4) s × 50 |
+| con un `.protect.json` que cubre lo grabado, la retención se para (más de 5 segmentos, `replay/protected_hold` > 0); al borrarlo recupera su tamaño y `protected_hold` vuelve a 0 | |
 | un canal de 16 bits graba `vmx-p216`, y un gris se reproduce idéntico y neutro (diferencia entre canales ≤ 1 LSB) | sin el reescalado de §9, 2 LSB de dominante: **verificado con una mutación**, falla |
 | `REMOVE` de una segunda grabación la quita y deja la primera grabando | |
 | `SEEK N` en pausa muestra el registro N, los dos extremos incluidos (marca m0+N) | un seek que cae un registro más allá, o una grabación con un hueco o un frame repetido, que desplaza todo lo que viene detrás |
+| `STEP 5`, `STEP -3`, una ráfaga de diez `STEP 1` y `STEP -100000` desde el registro 100 muestran 105, 102, 112 y 0 (leído de la imagen), la capa queda con `replay/speed` 0, y `STEP x` se rechaza con 4xx | una ráfaga que pierde pasos, o un paso que no recorta |
 | a `SPEED 1`, `2`, `-1` y `0.5`, **cada frame** de la salida avanza 1, 2, −1, y 0/1 alternos (≈ 115 frames por velocidad, grabados con `FILE`), y `file/frame` avanza a 50, 100, −50 y 25 registros/s (±10 %) | un frame repetido o saltado en cualquier punto del tramo |
-| `LOOP IN 100 OUT 150` no sale de [100, 150) y da la vuelta; la imagen es un registro del rango | |
+| `LOOP IN 100 OUT 150` no sale de [100, 150) y da la vuelta; la imagen es un registro del rango; se publican `replay/in` 100, `replay/out` 150, `replay/loop` y `replay/speed` | |
 | sin `LOOP`, hacia delante se para y se queda en `OUT−1` (con `replay/at_end`), hacia atrás en `IN`, sin negro | |
 | `SPEED 4` hacia el final de una grabación en curso vuelve a velocidad 1 pegado a la cabeza | |
 | un canal 1080i50 graba un registro por campo (50/s, como en CasparVP), lo muestra limpio en pausa y lo reproduce a 50/s | |
 | la retención borra el segmento de un lector parado en el registro 0, y al reanudar el servidor sigue vivo y la imagen es legible | |
 | regrabar con un nombre existente deja la primera grabación intacta y graba la segunda con otro nombre | |
+
+**Resultados (2026-11-15): 57/57** en WSL2 Ubuntu 24.04 (FFmpeg 6.1, GCC 13.3, GTX 1080 a través del
+driver D3D12 de Mesa), con las comprobaciones de manifiesto, material protegido, `STEP` y estado
+publicado.
 
 **Resultados (2026-11-06): 50/50** en WSL2 Ubuntu 24.04 con FFmpeg 6.1 y con FFmpeg 8.1.2 (GCC 13.3,
 mezclador OpenGL sobre el driver D3D12 de Mesa). Las 28 comprobaciones anteriores pasaron también

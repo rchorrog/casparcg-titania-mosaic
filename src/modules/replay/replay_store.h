@@ -40,8 +40,10 @@
 #include <boost/filesystem.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -92,6 +94,22 @@ struct record_meta
 
 constexpr uint32_t timecode_unknown = 0xFFFFFFFFu;
 
+/// How a recording was asked for, written into the manifest so a client listing `media/` knows
+/// what it is looking at without opening the recording. 0 = not known.
+struct recording_info
+{
+    int source_channel   = 0;
+    int max_duration_sec = 0;
+    int segment_sec      = 0;
+};
+
+/// A wall-clock range, in microseconds since the Unix epoch, that retention must not delete.
+struct protected_range
+{
+    uint64_t from_us = 0;
+    uint64_t to_us   = 0;
+};
+
 /// Why a writer stopped, or empty.
 struct write_error
 {
@@ -113,8 +131,14 @@ class writer
 
     /// `dir` is the recording's own directory (created); files are `dir/<stem>.*`.
     /// `segment_records` rolls a segment; `retain_records` deletes whole segments from the front
-    /// once the recording holds more than that (0 = keep everything).
-    bool open(const boost::filesystem::path& dir, const format& fmt, int64_t segment_records, int64_t retain_records);
+    /// once the recording holds more than that (0 = keep everything), except a segment that
+    /// overlaps a range of `dir/<stem>.protect.json`: retention stops there, and the recording
+    /// grows past its retention until the range is removed from the file.
+    bool open(const boost::filesystem::path& dir,
+              const format&                  fmt,
+              int64_t                        segment_records,
+              int64_t                        retain_records,
+              const recording_info&          info = {});
 
     /// Appends one record. FALSE means the recording has failed and will accept nothing more;
     /// `error()` says why. A record is either wholly in the payload with its index entry after it,
@@ -128,6 +152,9 @@ class writer
     int64_t            records() const { return records_; }
     int                segments_held() const { return static_cast<int>(segments_.size()); }
 
+    /// Records held beyond the retention window because a protected range stopped retention.
+    int64_t protected_hold() const { return protected_hold_; }
+
   private:
     struct segment
     {
@@ -135,11 +162,15 @@ class writer
         boost::filesystem::path seg_path;
         boost::filesystem::path idx_path;
         int64_t                 records = 0;
+        uint64_t                first_wall_us = 0;
+        uint64_t                last_wall_us  = 0;
     };
 
     bool roll();
     void close_current(bool sync);
     void retire_old();
+    bool is_protected(const segment& s);
+    void reload_protection();
     void fail(const std::string& what);
 
     boost::filesystem::path dir_;
@@ -157,6 +188,13 @@ class writer
     int                 next_index_   = 0;
     write_error         error_;
     std::vector<uint8_t> scratch_;
+
+    boost::filesystem::path      protect_path_;
+    std::vector<protected_range> protected_;
+    std::time_t                  protect_mtime_     = 0;
+    bool                         protect_exists_    = false;
+    std::chrono::steady_clock::time_point protect_checked_{};
+    int64_t                      protected_hold_    = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────

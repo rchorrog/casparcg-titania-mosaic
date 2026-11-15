@@ -208,6 +208,10 @@ boost::filesystem::path manifest_path_of(const boost::filesystem::path& dir, con
 {
     return dir / (stem + ".rman.json");
 }
+boost::filesystem::path protect_path_of(const boost::filesystem::path& dir, const std::string& stem)
+{
+    return dir / (stem + ".protect.json");
+}
 
 /// `<stem>.NNNNNN.rseg` -> NNNNNN, or -1.
 int segment_number(const std::string& filename, const std::string& stem, const char* ext)
@@ -326,7 +330,7 @@ bool header_valid(const record_header& h)
            static_cast<uint64_t>(h.audio_bytes) + h.video_bytes < (512ull << 20);
 }
 
-void write_manifest(const boost::filesystem::path& p, const format& f)
+void write_manifest(const boost::filesystem::path& p, const format& f, const recording_info& info)
 {
     // Written by hand: boost's property-tree JSON writer quotes EVERY value, so `"version": "2"`
     // -- a manifest whose numbers a client has to parse twice. The reader below still reads it.
@@ -353,6 +357,9 @@ void write_manifest(const boost::filesystem::path& p, const format& f)
        << "  \"audio_channels\": " << f.audio_channels << ",\n"
        << "  \"sample_rate\": " << f.sample_rate << ",\n"
        << "  \"vmx_profile\": " << f.vmx_profile << ",\n"
+       << "  \"source_channel\": " << info.source_channel << ",\n"
+       << "  \"max_duration\": " << info.max_duration_sec << ",\n"
+       << "  \"segment_duration\": " << info.segment_sec << ",\n"
        << "  \"created\": \"" << iso << "\"\n"
        << "}\n";
     // Written whole and renamed into place, so a reader never sees half a manifest.
@@ -437,7 +444,11 @@ boost::filesystem::path recording_dir(const std::wstring& name)
 
 writer::~writer() { close(); }
 
-bool writer::open(const boost::filesystem::path& dir, const format& fmt, int64_t segment_records, int64_t retain_records)
+bool writer::open(const boost::filesystem::path& dir,
+                  const format&                  fmt,
+                  int64_t                        segment_records,
+                  int64_t                        retain_records,
+                  const recording_info&          info)
 {
     close();
     error_          = {};
@@ -446,6 +457,12 @@ bool writer::open(const boost::filesystem::path& dir, const format& fmt, int64_t
     fmt_            = fmt;
     segment_records_ = std::max<int64_t>(1, segment_records);
     retain_records_  = std::max<int64_t>(0, retain_records);
+    protect_path_    = protect_path_of(dir_, stem_);
+    protected_.clear();
+    protect_mtime_   = 0;
+    protect_exists_  = false;
+    protect_checked_ = {};
+    protected_hold_  = 0;
 
     boost::system::error_code ec;
     boost::filesystem::create_directories(dir_, ec);
@@ -453,7 +470,7 @@ bool writer::open(const boost::filesystem::path& dir, const format& fmt, int64_t
         fail("cannot create " + dir_.string() + ": " + ec.message());
         return false;
     }
-    write_manifest(manifest_path_of(dir_, stem_), fmt_);
+    write_manifest(manifest_path_of(dir_, stem_), fmt_, info);
     return roll();
 }
 
@@ -578,11 +595,74 @@ bool writer::append(const record_meta& meta, const void* audio, size_t audio_byt
     }
 
     seg_offset_ += total;
+    if (cur.records == 0)
+        cur.first_wall_us = meta.wall_us;
+    cur.last_wall_us = meta.wall_us;
     cur.records++;
     held_records_++;
     records_++;
     retire_old();
     return true;
+}
+
+void writer::reload_protection()
+{
+    // Read at most once a second, and only when the file changed: retire_old runs on every
+    // record, and while a protected segment holds retention its condition stays true.
+    const auto now = std::chrono::steady_clock::now();
+    if (protect_checked_ != std::chrono::steady_clock::time_point{} && now - protect_checked_ < std::chrono::seconds(1))
+        return;
+    protect_checked_ = now;
+
+    boost::system::error_code ec;
+    if (!boost::filesystem::exists(protect_path_, ec)) {
+        if (protect_exists_)
+            CASPAR_LOG(info) << L"[replay] " << protect_path_.wstring() << L" removed; nothing is protected";
+        protect_exists_ = false;
+        protect_mtime_  = 0;
+        protected_.clear();
+        return;
+    }
+    const auto mtime = boost::filesystem::last_write_time(protect_path_, ec);
+    if (ec || (protect_exists_ && mtime == protect_mtime_))
+        return;
+
+    // A file that does not parse keeps the ranges read before: dropping them would let retention
+    // delete material an operator marked, which is the one thing this file exists to prevent.
+    try {
+        boost::property_tree::ptree t;
+        boost::property_tree::read_json(protect_path_.string(), t);
+        std::vector<protected_range> ranges;
+        if (auto list = t.get_child_optional("ranges")) {
+            for (const auto& item : *list) {
+                protected_range r;
+                r.from_us = item.second.get<uint64_t>("from_us");
+                r.to_us   = item.second.get<uint64_t>("to_us");
+                if (r.to_us < r.from_us)
+                    std::swap(r.from_us, r.to_us);
+                ranges.push_back(r);
+            }
+        }
+        protected_      = std::move(ranges);
+        protect_mtime_  = mtime;
+        protect_exists_ = true;
+        CASPAR_LOG(info) << L"[replay] " << protect_path_.wstring() << L": " << protected_.size()
+                         << L" protected range(s)";
+    } catch (const std::exception& e) {
+        protect_mtime_  = mtime;
+        protect_exists_ = true;
+        CASPAR_LOG(warning) << L"[replay] " << protect_path_.wstring() << L" does not parse (" << u16(e.what())
+                            << L"); keeping the " << protected_.size() << L" range(s) read before";
+    }
+}
+
+bool writer::is_protected(const segment& s)
+{
+    for (const auto& r : protected_) {
+        if (s.first_wall_us <= r.to_us && s.last_wall_us >= r.from_us)
+            return true;
+    }
+    return false;
 }
 
 void writer::retire_old()
@@ -591,6 +671,14 @@ void writer::retire_old()
         return;
     // Whole segments, oldest first, while what would remain still covers the retention window.
     while (segments_.size() > 1 && held_records_ - segments_.front().records >= retain_records_) {
+        // Retention only ever removes from the front -- readers number positions from the oldest
+        // record held -- so a protected segment stops it, and the recording grows past its
+        // retention until the range is taken out of the protect file.
+        reload_protection();
+        if (is_protected(segments_.front())) {
+            protected_hold_ = held_records_ - retain_records_;
+            return;
+        }
         const auto old = segments_.front();
         boost::system::error_code ec1, ec2;
         // Payload first, index second: a reader that sees the index gone treats the segment as
@@ -605,6 +693,7 @@ void writer::retire_old()
         held_records_ -= old.records;
         segments_.pop_front();
     }
+    protected_hold_ = 0;
 }
 
 void writer::close()

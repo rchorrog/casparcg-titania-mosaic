@@ -494,6 +494,11 @@ void replay_producer::publish(const cached& shown, bool at_end)
     state_["replay/frame_number"]   = shown.frame_number;
     state_["replay/live"]           = t.live;
     state_["replay/live_distance"]  = t.live_distance;
+    state_["replay/speed"]          = t.speed;
+    state_["replay/loop"]           = t.loop;
+    // IN and OUT as positions, like `file/frame`; OUT 0 = following the end of the material.
+    state_["replay/in"]             = t.in_serial < 0 ? int64_t{0} : std::max<int64_t>(0, t.in_serial - t.retired);
+    state_["replay/out"]            = t.out_serial < 0 ? int64_t{0} : std::max<int64_t>(0, t.out_serial - t.retired);
     state_["replay/at_end"]         = at_end;
     state_["replay/decoded_ahead"]  = decoded_ahead_.load();
     state_["replay/late_decodes"]   = late_decodes_.load();
@@ -576,6 +581,33 @@ void replay_producer::enter_live(int64_t distance)
     t_.started       = true;
 }
 
+void replay_producer::step_frames(int64_t n)
+{
+    // Paused and not following: count from the frame already asked for, so a burst of jog steps
+    // faster than the channel ticks adds up instead of each one restarting from the frame on air.
+    // Otherwise from the frame on air. Either way the layer is left paused on the result.
+    bool    from_target = false;
+    int64_t target_fn   = 0;
+    {
+        std::lock_guard<std::mutex> lock(transport_mutex_);
+        if (t_.started && !t_.live && std::abs(t_.speed) < 1e-9) {
+            from_target = true;
+            target_fn   = static_cast<int64_t>(std::floor(t_.next_fn));
+        }
+    }
+    int64_t position;
+    {
+        std::lock_guard<std::mutex> io(io_mutex_);
+        const int64_t count = src_->count();
+        if (count <= 0)
+            return;
+        const int64_t base = from_target ? src_->position_of_frame(target_fn) : shown_serial_.load() - src_->retired();
+        position           = std::clamp<int64_t>(base + n, 0, count - 1);
+    }
+    set_speed(0.0);
+    seek_position(position);
+}
+
 void replay_producer::set_speed(double s)
 {
     std::lock_guard<std::mutex> lock(transport_mutex_);
@@ -648,10 +680,17 @@ std::future<std::wstring> replay_producer::call(const std::vector<std::wstring>&
         kick();
         return make_ready_future(std::wstring(L"OK"));
     }
+    if (boost::iequals(cmd, L"STEP")) {
+        int64_t n = 0;
+        if (!parse_int(arg(1), n))
+            refuse(L"STEP takes a whole number of frames, + or -, not '" + params[1] + L"'");
+        step_frames(n);
+        return make_ready_future(std::wstring(L"OK"));
+    }
     if (boost::iequals(cmd, L"EXPORT"))
         return start_export(params);
 
-    refuse(L"CALL: unknown '" + cmd + L"'. Supported: SEEK, LIVE, IN, OUT, LOOP, SPEED, EXPORT");
+    refuse(L"CALL: unknown '" + cmd + L"'. Supported: SEEK, LIVE, IN, OUT, LOOP, SPEED, STEP, EXPORT");
 }
 
 void replay_producer::configure(const std::vector<std::wstring>& params)

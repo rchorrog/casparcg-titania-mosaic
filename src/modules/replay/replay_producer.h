@@ -118,6 +118,8 @@ class replay_producer final : public core::frame_producer
     void    set_in(int64_t position);
     void    set_out(int64_t position);
     void    enter_live(int64_t distance);
+    /// Moves `n` records (+ forward, - back) and pauses there: the jog.
+    void    step_frames(int64_t n);
     void    set_speed(double s);
     void    publish(const cached& shown, bool at_end);
     void    kick();

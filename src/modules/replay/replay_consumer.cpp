@@ -256,10 +256,15 @@ void replay_consumer::initialize(const core::video_format_desc& format_desc,
     encoder_ = make_encoder(fmt_);
     writer_  = std::make_unique<store::writer>();
     const double tps = fmt_.ticks_per_second();
+    store::recording_info info;
+    info.source_channel   = channel_info.index;
+    info.max_duration_sec = req_.max_duration_sec;
+    info.segment_sec      = req_.segment_sec;
     if (!writer_->open(dir_,
                        fmt_,
                        static_cast<int64_t>(std::llround(req_.segment_sec * tps)),
-                       static_cast<int64_t>(std::llround(req_.max_duration_sec * tps)))) {
+                       static_cast<int64_t>(std::llround(req_.max_duration_sec * tps)),
+                       info)) {
         fail(writer_->error().what);
     }
 
@@ -403,6 +408,7 @@ void replay_consumer::publish()
     state_["replay/frames_written"] = written;
     state_["replay/dropped_frames"] = dropped;
     state_["replay/segments"]       = writer_ ? writer_->segments_held() : 0;
+    state_["replay/protected_hold"] = writer_ ? writer_->protected_hold() : 0;
     // The v1 keys, kept: batteries and clients read them.
     state_["frames_written"] = written;
     state_["dropped_frames"] = dropped;
