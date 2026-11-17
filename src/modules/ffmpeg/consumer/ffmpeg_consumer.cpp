@@ -660,6 +660,19 @@ struct ffmpeg_consumer : public core::frame_consumer
                     options.erase(key);
                 }
 
+                // "service_name" / "service_provider": nombre y proveedor del servicio del SDT del MPEG-TS
+                // (lo que un decodificador/DCM muestra como identificador de la señal). No son opciones del
+                // muxer sino metadatos del contenedor (el equivalente a `-metadata service_name=...` del CLI
+                // de ffmpeg): sin esto el muxer pone "Service01" / "FFmpeg". Los valores no pueden llevar
+                // espacios (los argumentos del ADD STREAM se separan por ellos): quien llama los sanea.
+                for (const char* key : {"service_name", "service_provider"}) {
+                    const auto it = options.find(key);
+                    if (it != options.end()) {
+                        av_dict_set(&oc->metadata, key, it->second.c_str(), 0);
+                        options.erase(it);
+                    }
+                }
+
                 if (!(oc->oformat->flags & AVFMT_NOFILE)) {
                     // TODO (fix) interrupt_cb
                     auto dict = to_dict(std::move(options));
