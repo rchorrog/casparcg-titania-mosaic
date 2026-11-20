@@ -229,6 +229,13 @@ bool has_invalid_protocol(const std::wstring& filename) { return boost::algorith
 
 bool is_readable(const boost::filesystem::path& filename)
 {
+    // En Linux un ifstream abre un directorio sin error y el primer read lanza
+    // "basic_filebuf::underflow ... Is a directory"; en Windows la apertura ya falla.
+    // Una grabacion de replay es un directorio en media/, asi que cada PLAY la pasaba por aqui.
+    boost::system::error_code ec;
+    if (boost::filesystem::is_directory(filename, ec)) {
+        return false;
+    }
     boost::filesystem::ifstream file(filename);
     if (file) {
         return true;

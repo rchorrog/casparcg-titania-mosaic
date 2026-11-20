@@ -141,14 +141,29 @@ void Input::run_read_loop()
                 break;
             }
 
-            try {
-                std::unique_lock<std::mutex> lock(ic_mutex_);
-                eof_ = false;
-                internal_reset();
-                was_reopened = true;
-            } catch (...) {
-                // Still down. Stay in the loop and try again after a longer backoff; do not
-                // log again here, the counter above already tells the story.
+            // Se suelta primero la conexión vieja: una entrada UDP unicast no puede volver a
+            // enlazar su puerto mientras el socket viejo lo tiene ("bind failed: Address already
+            // in use"), así que tras un desbordamiento del búfer UDP cada reapertura fallaba y el
+            // tile quedaba congelado para siempre. El contexto sigue vivo para los decodificadores
+            // que lo retienen, pero ya no se lee de él: si la reapertura falla se reintenta aquí,
+            // sin volver a av_read_frame sobre un contexto sin `pb`.
+            std::unique_lock<std::mutex> lock(ic_mutex_);
+            if (ic_ && ic_->pb && !(ic_->iformat->flags & AVFMT_NOFILE)) {
+                avio_closep(&ic_->pb);
+            }
+            while (!abort_request_) {
+                try {
+                    eof_ = false;
+                    internal_reset();
+                    was_reopened = true;
+                    break;
+                } catch (...) {
+                    // Sigue caída. Sin log aquí: el contador de arriba ya lo cuenta.
+                    backoff_ms = std::min(backoff_ms * 2, 5000);
+                    lock.unlock();
+                    boost::this_thread::sleep_for(boost::chrono::milliseconds(backoff_ms));
+                    lock.lock();
+                }
             }
         }
     }
@@ -156,7 +171,9 @@ void Input::run_read_loop()
 
 Input::~Input()
 {
-    graph_         = spl::shared_ptr<diagnostics::graph>();
+    // `graph_` is NOT reset here any more (upstream #1748): the read thread calls
+    // graph_->set_value() until it is joined below, and reassigning a shared_ptr another thread
+    // is reading is a data race. It is released with the object, after the join.
     request_abort();
 
     std::shared_ptr<AVPacket> packet;
@@ -179,8 +196,23 @@ bool Input::try_pop(std::shared_ptr<AVPacket>& packet)
     return result;
 }
 
-AVFormatContext*       Input::operator->() { return ic_.get(); }
-AVFormatContext* const Input::operator->() const { return ic_.get(); }
+std::shared_ptr<AVFormatContext> Input::context() const
+{
+    std::lock_guard<std::mutex> lock(published_mutex_);
+    return published_;
+}
+
+void Input::request_abort()
+{
+    // The flag goes first: interrupt_cb reads it without the lock, so a read or open that holds the
+    // lock returns promptly. The lock is taken before notifying so that the read thread cannot test
+    // the flag, miss this notification and then wait for good -- which hung the join below.
+    abort_request_ = true;
+    {
+        std::lock_guard<std::mutex> lock(ic_mutex_);
+    }
+    ic_cond_.notify_all();
+}
 
 void Input::request_abort()
 {
@@ -312,6 +344,10 @@ void Input::internal_reset()
 
     FF(avformat_find_stream_info(ic2.get(), nullptr));
     ic_ = std::move(ic2);
+    {
+        std::lock_guard<std::mutex> lock(published_mutex_);
+        published_ = ic_;
+    }
     ic_cond_.notify_all();
 }
 

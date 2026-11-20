@@ -15,6 +15,11 @@ add_subdirectory(screen)
 add_subdirectory(newtek)
 add_subdirectory(artnet)
 
+option(BUILD_REPLAY "Build Replay module" ON)
+if (BUILD_REPLAY)
+	add_subdirectory(replay)
+endif ()
+
 if (ENABLE_HTML)
 	add_subdirectory(html)
 endif ()

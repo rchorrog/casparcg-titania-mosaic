@@ -43,6 +43,9 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/regex.hpp>
 
+#include <set>
+#include <vector>
+
 #pragma warning(push)
 #pragma warning(disable : 4244)
 #pragma warning(disable : 4245)
@@ -102,9 +105,11 @@ struct Stream
            const core::video_format_desc&      format_desc,
            bool                                realtime,
            common::bit_depth                   depth,
-           std::map<std::string, std::string>& options)
+           std::map<std::string, std::string>& options,
+           std::set<std::string>&              used_unsuffixed)
     {
         std::map<std::string, std::string> stream_options;
+        std::set<std::string>              folded; // unsuffixed keys copied in; see the fold below
 
         {
             auto tmp = std::move(options);
@@ -138,6 +143,33 @@ struct Stream
 
         if (!codec) {
             FF_RET(AVERROR(EINVAL), "avcodec_find_encoder");
+        }
+
+        // AN UNSUFFIXED CODEC OPTION GOES TO EVERY ENCODER THAT HAS IT -- the ffmpeg CLI's rule
+        // (fftools/cmdutils.c, filter_codec_opts), ported from CasparVP. Only `:v`/`:a` keys used
+        // to reach a stream, so `-g 10`, `-tune zerolatency`, `-crf 25` -- the spelling of the 2.5
+        // CHANGELOG's own example -- fell through to the muxer and were logged as "Unused option".
+        // Measured with tools/test/live_input_test.py: `-g 10` gave keyframes every 12 frames
+        // (the default) instead of 10. COPIED, not moved, as the CLI does: the other stream sees it
+        // too; it leaves the muxer's options only once some encoder took it. A suffixed key wins.
+        {
+            static const std::set<std::string> interpreted_here = {"codec", "filter", "format", "an"};
+            const AVClass* generic = avcodec_get_class();
+            const AVClass* priv    = codec->priv_class;
+            const int      flags   = AV_OPT_FLAG_ENCODING_PARAM |
+                              (codec->type == AVMEDIA_TYPE_VIDEO ? AV_OPT_FLAG_VIDEO_PARAM : AV_OPT_FLAG_AUDIO_PARAM);
+            for (const auto& p : options) {
+                const auto& key = p.first;
+                if (p.second.empty() || key.find(':') != std::string::npos || interpreted_here.count(key) ||
+                    stream_options.count(key)) {
+                    continue;
+                }
+                if (av_opt_find(&generic, key.c_str(), nullptr, flags, AV_OPT_SEARCH_FAKE_OBJ) ||
+                    (priv && av_opt_find(&priv, key.c_str(), nullptr, flags, AV_OPT_SEARCH_FAKE_OBJ))) {
+                    stream_options.emplace(key, p.second);
+                    folded.insert(key);
+                }
+            }
         }
 
         AVFilterInOut* outputs = nullptr;
@@ -209,9 +241,18 @@ struct Stream
             }
         }
 
+        // FFmpeg 8 removed the buffersink's list options (pix_fmts, sample_fmts, sample_rates): set
+        // through av_opt_set_int_list they fail with EINVAL, so on FFmpeg 8 every PLAY and every
+        // STREAM/FILE output failed at graph construction (measured: titania built against 8.1.2).
+        // The sink is allocated, given the array options, then initialised -- upstream 480e9b00e
+        // (#1715). Below FFmpeg 8 the code is exactly what it was.
         if (codec->type == AVMEDIA_TYPE_VIDEO) {
+#if LIBAVUTIL_VERSION_MAJOR >= 60
+            sink = FFMEM(avfilter_graph_alloc_filter(graph.get(), avfilter_get_by_name("buffersink"), "out"));
+#else
             FF(avfilter_graph_create_filter(
                 &sink, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr, graph.get()));
+#endif
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -220,20 +261,51 @@ struct Stream
             // TODO codec->profiles
             // TODO FF(av_opt_set_int_list(sink, "framerates", codec->supported_framerates, { 0, 0 },
             // AV_OPT_SEARCH_CHILDREN));
+#if LIBAVUTIL_VERSION_MAJOR >= 60
+            {
+                const void* pix_fmts    = nullptr;
+                int         nb_pix_fmts = 0;
+                FF(avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &pix_fmts, &nb_pix_fmts));
+                FF(av_opt_set_array(sink, "pixel_formats", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE, 0,
+                                    static_cast<unsigned>(nb_pix_fmts), AV_OPT_TYPE_PIXEL_FMT, pix_fmts));
+            }
+#else
             FF(av_opt_set_int_list(sink, "pix_fmts", codec->pix_fmts, -1, AV_OPT_SEARCH_CHILDREN));
+#endif
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
         } else if (codec->type == AVMEDIA_TYPE_AUDIO) {
+#if LIBAVUTIL_VERSION_MAJOR >= 60
+            sink = FFMEM(avfilter_graph_alloc_filter(graph.get(), avfilter_get_by_name("abuffersink"), "out"));
+#else
             FF(avfilter_graph_create_filter(
                 &sink, avfilter_get_by_name("abuffersink"), "out", nullptr, nullptr, graph.get()));
+#endif
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4245)
 #endif
             // TODO codec->profiles
+#if LIBAVUTIL_VERSION_MAJOR >= 60
+            {
+                const void* sample_fmts    = nullptr;
+                int         nb_sample_fmts = 0;
+                FF(avcodec_get_supported_config(
+                    nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &sample_fmts, &nb_sample_fmts));
+                FF(av_opt_set_array(sink, "sample_formats", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE, 0,
+                                    static_cast<unsigned>(nb_sample_fmts), AV_OPT_TYPE_SAMPLE_FMT, sample_fmts));
+                const void* sample_rates    = nullptr;
+                int         nb_sample_rates = 0;
+                FF(avcodec_get_supported_config(
+                    nullptr, codec, AV_CODEC_CONFIG_SAMPLE_RATE, 0, &sample_rates, &nb_sample_rates));
+                FF(av_opt_set_array(sink, "samplerates", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE, 0,
+                                    static_cast<unsigned>(nb_sample_rates), AV_OPT_TYPE_INT, sample_rates));
+            }
+#else
             FF(av_opt_set_int_list(sink, "sample_fmts", codec->sample_fmts, -1, AV_OPT_SEARCH_CHILDREN));
             FF(av_opt_set_int_list(sink, "sample_rates", codec->supported_samplerates, 0, AV_OPT_SEARCH_CHILDREN));
+#endif
 
 #if FFMPEG_NEW_CHANNEL_LAYOUT
             // TODO: need to translate codec->ch_layouts into something that can be passed via av_opt_set_*
@@ -249,6 +321,10 @@ struct Stream
             CASPAR_THROW_EXCEPTION(ffmpeg_error_t()
                                    << boost::errinfo_errno(EINVAL) << msg_info_t("invalid output media type"));
         }
+
+#if LIBAVUTIL_VERSION_MAJOR >= 60
+        FF(avfilter_init_str(sink, nullptr));
+#endif
 
         {
             const auto cur = outputs;
@@ -327,8 +403,17 @@ struct Stream
         auto dict = to_dict(std::move(stream_options));
         CASPAR_SCOPE_EXIT { av_dict_free(&dict); };
         FF(avcodec_open2(enc.get(), codec, &dict));
-        for (auto& p : to_map(&dict)) {
-            options[p.first] = p.second + suffix;
+        // What the encoder did not take goes back for the muxer, under its SUFFIXED key. This used
+        // to append the suffix to the VALUE (`g=10:v`), so the "Unused option" line misnamed it.
+        // A folded key is not handed back: its unsuffixed original is still in `options`.
+        auto leftovers = to_map(&dict);
+        for (const auto& key : folded) {
+            if (leftovers.erase(key) == 0) {
+                used_unsuffixed.insert(key);
+            }
+        }
+        for (auto& p : leftovers) {
+            options[p.first + suffix] = p.second;
         }
 
         FF(avcodec_parameters_from_context(st->codecpar, enc.get()));
@@ -484,6 +569,21 @@ struct ffmpeg_consumer : public core::frame_consumer
                         options[(*it)["NAME"].str().c_str()] =
                             (*it)["VALUE"].matched ? (*it)["VALUE"].str().c_str() : "";
                     }
+
+                    // The ffmpeg CLI's short spellings are aliases of the ones this consumer reads.
+                    // `-f mpegts` used to be ignored (measured: "Unable to choose an output format"
+                    // for udp://, so the output never opened) and `-vcodec`/`-c:v` never chose the
+                    // codec (measured: mpeg2video instead of libx264). A clash between two
+                    // spellings of one option is left alone: the explicit long form wins.
+                    for (const auto& alias : std::vector<std::pair<std::string, std::string>>{
+                             {"c:v", "codec:v"}, {"vcodec", "codec:v"}, {"c:a", "codec:a"}, {"acodec", "codec:a"},
+                             {"vf", "filter:v"}, {"af", "filter:a"}, {"f", "format"}}) {
+                        const auto it = options.find(alias.first);
+                        if (it != options.end() && options.count(alias.second) == 0) {
+                            options[alias.second] = std::move(it->second);
+                            options.erase(it);
+                        }
+                    }
                 }
 
                 boost::filesystem::path full_path = path_;
@@ -520,12 +620,17 @@ struct ffmpeg_consumer : public core::frame_consumer
 
                 CASPAR_SCOPE_EXIT { avformat_free_context(oc); };
 
+                std::set<std::string> used_unsuffixed; // filled by the Streams; see Stream::Stream
                 std::optional<Stream> video_stream;
                 if (oc->oformat->video_codec != AV_CODEC_ID_NONE) {
-                    if (oc->oformat->video_codec == AV_CODEC_ID_H264 && options.find("preset:v") == options.end()) {
+                    // The default preset is ours, and must not override the operator's: an
+                    // unsuffixed `-preset` reaches the encoder now, and a suffixed key would win.
+                    if (oc->oformat->video_codec == AV_CODEC_ID_H264 && options.find("preset:v") == options.end() &&
+                        options.find("preset") == options.end()) {
                         options["preset:v"] = "veryfast";
                     }
-                    video_stream.emplace(oc, ":v", oc->oformat->video_codec, format_desc, realtime_, depth_, options);
+                    video_stream.emplace(
+                        oc, ":v", oc->oformat->video_codec, format_desc, realtime_, depth_, options, used_unsuffixed);
 
                     {
                         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -546,7 +651,26 @@ struct ffmpeg_consumer : public core::frame_consumer
 
                 std::optional<Stream> audio_stream;
                 if (!no_audio && oc->oformat->audio_codec != AV_CODEC_ID_NONE) {
-                    audio_stream.emplace(oc, ":a", oc->oformat->audio_codec, format_desc, realtime_, depth_, options);
+                    audio_stream.emplace(
+                        oc, ":a", oc->oformat->audio_codec, format_desc, realtime_, depth_, options, used_unsuffixed);
+                }
+
+                // An unsuffixed option some encoder took is done; the muxer must not report it.
+                for (const auto& key : used_unsuffixed) {
+                    options.erase(key);
+                }
+
+                // "service_name" / "service_provider": nombre y proveedor del servicio del SDT del MPEG-TS
+                // (lo que un decodificador/DCM muestra como identificador de la señal). No son opciones del
+                // muxer sino metadatos del contenedor (el equivalente a `-metadata service_name=...` del CLI
+                // de ffmpeg): sin esto el muxer pone "Service01" / "FFmpeg". Los valores no pueden llevar
+                // espacios (los argumentos del ADD STREAM se separan por ellos): quien llama los sanea.
+                for (const char* key : {"service_name", "service_provider"}) {
+                    const auto it = options.find(key);
+                    if (it != options.end()) {
+                        av_dict_set(&oc->metadata, key, it->second.c_str(), 0);
+                        options.erase(it);
+                    }
                 }
 
                 // "service_name" / "service_provider": nombre y proveedor del servicio del SDT del MPEG-TS

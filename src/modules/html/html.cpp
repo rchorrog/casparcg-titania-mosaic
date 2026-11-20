@@ -46,6 +46,39 @@
 #include <include/cef_version.h>
 #pragma warning(pop)
 
+// ── CEF mallinfo() overflow -> SIGILL on the MemoryInfra thread (upstream 8e27c4ba8, #1821) ──
+// CEF's official Linux binaries are built with use_sysroot=true against glibc < 2.33, so
+// MallocDumpProvider::OnMemoryDump() calls the 32-bit mallinfo(). Past ~2 GB of malloc arena its
+// int fields overflow negative, a sanity check executes UD2, and the whole server dies with
+// SIGILL -- the crash recorded in BUILD.md (OnMemoryDump in malloc_dump_provider.cc). This tree
+// already uses a CEF built WITHOUT the sysroot, which should call mallinfo2() and never reach
+// this; the override is defence in depth for any CEF that does, and is inert otherwise.
+#if defined(__linux__)
+#include <algorithm>
+#include <climits>
+#include <dlfcn.h>
+#include <malloc.h>
+
+extern "C" struct mallinfo mallinfo(void)
+{
+    struct mallinfo2 m2 = mallinfo2();
+    struct mallinfo   m {};
+    // Each field below INT32_MAX / 2, so CEF's signed-int sums (arena + hblkhd) cannot overflow.
+    auto clamp = [](size_t v) { return static_cast<int>(std::min<size_t>(v, INT32_MAX / 2)); };
+    m.arena    = clamp(m2.arena);
+    m.ordblks  = clamp(m2.ordblks);
+    m.smblks   = clamp(m2.smblks);
+    m.hblks    = clamp(m2.hblks);
+    m.hblkhd   = clamp(m2.hblkhd);
+    m.usmblks  = clamp(m2.usmblks);
+    m.fsmblks  = clamp(m2.fsmblks);
+    m.uordblks = clamp(m2.uordblks);
+    m.fordblks = clamp(m2.fordblks);
+    m.keepcost = clamp(m2.keepcost);
+    return m;
+}
+#endif
+
 namespace caspar::html {
 
 std::unique_ptr<executor> g_cef_executor;
@@ -237,6 +270,17 @@ bool intercept_command_line(int argc, char** argv)
 
 void init(const core::module_dependencies& dependencies)
 {
+#if defined(__linux__)
+    // Say whether the override above is what the dynamic linker resolves, before CEF starts.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    if (reinterpret_cast<void*>(dlsym(RTLD_DEFAULT, "mallinfo")) == reinterpret_cast<void*>(&mallinfo)) {
+#pragma GCC diagnostic pop
+        CASPAR_LOG(info) << L"[html] mallinfo() override installed";
+    } else {
+        CASPAR_LOG(warning) << L"[html] mallinfo() override did NOT install; CEF mallinfo() SIGILL (cef#3963) may occur";
+    }
+#endif
     dependencies.producer_registry->register_producer_factory(L"HTML Producer", html::create_producer);
 
     CefMainArgs main_args;
